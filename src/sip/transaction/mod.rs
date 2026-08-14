@@ -36,3 +36,6 @@ pub mod server;
 
 /// Bounded transaction registry and event routing.
 pub mod manager;
+
+/// Compact completion authority after heavy transaction removal.
+pub mod completion;

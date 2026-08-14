@@ -28,8 +28,10 @@
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
+use std::time::Duration;
 
 use super::client::{Action as ClientAction, ClientError, ClientTransaction, Timer as ClientTimer};
+use super::completion::{CompletionDisposition, CompletionError, CompletionStore};
 use super::key::{KeyError, TransactionKey};
 use super::server::{
     Action as ServerAction, DuplicateRequestDisposition, ServerError, ServerTransaction,
@@ -131,6 +133,17 @@ pub enum AckRoute {
     Dialog,
 }
 
+/// Routing result including compact completed-INVITE state.
+#[derive(Debug)]
+pub enum ClientResponseRoute {
+    /// A live heavy transaction processed the response.
+    Live(RoutedActions<ClientAction>),
+    /// Compact completion state handled a late/retransmitted final response.
+    Retained(CompletionDisposition),
+    /// No live or retained transaction matched.
+    Unknown,
+}
+
 struct Entry<T> {
     generation: u64,
     transaction: T,
@@ -143,6 +156,7 @@ pub struct TransactionManager {
     shutting_down: bool,
     clients: HashMap<TransactionKey, Entry<ClientTransaction>>,
     servers: HashMap<TransactionKey, Entry<ServerTransaction>>,
+    completions: CompletionStore,
 }
 
 impl TransactionManager {
@@ -164,6 +178,7 @@ impl TransactionManager {
             shutting_down: false,
             clients: HashMap::new(),
             servers: HashMap::new(),
+            completions: CompletionStore::new(maximum).map_err(ManagerError::Completion)?,
         })
     }
 
@@ -234,6 +249,28 @@ impl TransactionManager {
             .on_response(response)
             .map_err(ManagerError::Client)?;
         Ok(RoutedActions { token, actions })
+    }
+
+    /// Routes through live state first, then compact completed-INVITE state.
+    ///
+    /// # Errors
+    ///
+    /// Preserves transaction-key, live-state, and completion-store failures.
+    pub fn route_response_at(
+        &mut self,
+        response: &ValidatedResponse,
+        now: Duration,
+    ) -> Result<ClientResponseRoute, ManagerError> {
+        let key = TransactionKey::for_client_response(response).map_err(ManagerError::Key)?;
+        if self.clients.contains_key(&key) {
+            return self.route_response(response).map(ClientResponseRoute::Live);
+        }
+        self.completions
+            .route(response, now)
+            .map_err(ManagerError::Completion)
+            .map(|disposition| {
+                disposition.map_or(ClientResponseRoute::Unknown, ClientResponseRoute::Retained)
+            })
     }
 
     /// Routes a validated non-ACK request to existing server transaction state.
@@ -367,6 +404,55 @@ impl TransactionManager {
         }
     }
 
+    /// Removes exact live state and retains compact INVITE completion authority.
+    ///
+    /// The caller supplies monotonic time so this manager remains clock-free.
+    ///
+    /// # Errors
+    ///
+    /// Rejects deadline overflow, missing invariant state, or completion-store
+    /// capacity and allocation failures.
+    pub fn complete_at(&mut self, token: &Token, now: Duration) -> Result<bool, ManagerError> {
+        if token.role != Role::Client {
+            return Ok(remove_generation(&mut self.servers, token));
+        }
+        let matching = self
+            .clients
+            .get(&token.key)
+            .is_some_and(|entry| entry.generation == token.generation);
+        if !matching {
+            return Ok(false);
+        }
+        let entry = self
+            .clients
+            .remove(&token.key)
+            .ok_or(ManagerError::Unknown)?;
+        if entry.transaction.kind() == super::state::TransactionKind::Invite
+            && matches!(
+                entry.transaction.state(),
+                super::state::ClientState::Completed | super::state::ClientState::Accepted
+            )
+        {
+            let expires_at = now
+                .checked_add(entry.transaction.completion_retention())
+                .ok_or(ManagerError::TimeOverflow)?;
+            self.completions
+                .retain(
+                    token.key.clone(),
+                    token.generation,
+                    expires_at,
+                    entry.transaction.retained_failure_ack(),
+                )
+                .map_err(ManagerError::Completion)?;
+        }
+        Ok(true)
+    }
+
+    /// Reclaims expired compact completion state.
+    pub fn sweep_completions(&mut self, now: Duration) -> usize {
+        self.completions.sweep(now)
+    }
+
     /// Permanently fences new transaction admission.
     pub const fn begin_shutdown(&mut self) {
         self.shutting_down = true;
@@ -435,6 +521,7 @@ impl fmt::Debug for TransactionManager {
             .debug_struct("TransactionManager")
             .field("clients", &self.clients.len())
             .field("servers", &self.servers.len())
+            .field("completions", &self.completions.len())
             .field("maximum", &self.maximum)
             .field("shutting_down", &self.shutting_down)
             .finish_non_exhaustive()
@@ -479,6 +566,10 @@ pub enum ManagerError {
     Client(ClientError),
     /// Server engine rejected event.
     Server(ServerError),
+    /// Compact completion retention failed.
+    Completion(CompletionError),
+    /// Completion expiry arithmetic overflowed.
+    TimeOverflow,
     /// Bounded map allocation failed.
     AllocationFailed,
 }
@@ -495,6 +586,7 @@ impl StdError for ManagerError {
             Self::Key(error) => Some(error),
             Self::Client(error) => Some(error),
             Self::Server(error) => Some(error),
+            Self::Completion(error) => Some(error),
             _ => None,
         }
     }
@@ -504,7 +596,11 @@ impl StdError for ManagerError {
 mod tests {
     use std::sync::Arc;
 
-    use super::{AckRoute, ManagerError, Role, ServerRequestRoute, TransactionManager};
+    use std::time::Duration;
+
+    use super::{
+        AckRoute, ClientResponseRoute, ManagerError, Role, ServerRequestRoute, TransactionManager,
+    };
     use crate::sip::parser::message::parse;
     use crate::sip::transaction::client::{Action as ClientAction, ClientTransaction};
     use crate::sip::transaction::server::{Action as ServerAction, ServerTransaction};
@@ -693,5 +789,39 @@ Content-Length: 0\r\n\r\n"
         ));
         assert!(manager.is_empty());
         assert_eq!(manager.next_generation, u64::MAX);
+    }
+
+    #[test]
+    fn compact_completion_routes_late_success_after_heavy_state_removal() {
+        let Ok(mut transaction) = ClientTransaction::new(
+            request("INVITE", "z9hG4bK-one"),
+            true,
+            TimerConfig::default(),
+        ) else {
+            panic!("transaction")
+        };
+        assert!(transaction.start().is_ok());
+        assert!(transaction.on_response(&response(486)).is_ok());
+        let Ok(mut manager) = TransactionManager::new(8) else {
+            panic!("manager")
+        };
+        let token = manager
+            .insert_client(transaction)
+            .unwrap_or_else(|_| panic!("insert"));
+        assert!(matches!(
+            manager.complete_at(&token, Duration::ZERO),
+            Ok(true)
+        ));
+        assert!(matches!(
+            manager.route_response_at(&response(200), Duration::from_secs(1)),
+            Ok(ClientResponseRoute::Retained(
+                super::CompletionDisposition::DeliverLateSuccess { .. }
+            ))
+        ));
+        assert_eq!(manager.sweep_completions(Duration::from_secs(33)), 1);
+        assert!(matches!(
+            manager.route_response_at(&response(200), Duration::from_secs(33)),
+            Ok(ClientResponseRoute::Unknown)
+        ));
     }
 }

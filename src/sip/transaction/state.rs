@@ -122,6 +122,10 @@ impl ClientMachine {
                 300..=699,
             ) => ClientState::Completed,
             (TransactionKind::Invite, ClientState::Accepted, 200..=299) => ClientState::Accepted,
+            // A downstream fork can succeed after another branch already
+            // produced a non-2xx final response. Retaining the INVITE matching
+            // authority allows that late 2xx to reach the transaction user.
+            (TransactionKind::Invite, ClientState::Completed, 200..=299) => ClientState::Accepted,
             (TransactionKind::Invite, ClientState::Completed, 300..=699) => ClientState::Completed,
             (
                 TransactionKind::NonInvite,

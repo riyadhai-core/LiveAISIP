@@ -136,7 +136,9 @@ impl fmt::Debug for CallContext {
 
 fn timeline_event(event: &CallEvent) -> Option<TimelineEvent> {
     match event {
-        CallEvent::Command(CallCommand::Start) | CallEvent::CancelAccepted => None,
+        CallEvent::Command(CallCommand::Start)
+        | CallEvent::CancelAccepted
+        | CallEvent::SessionModification { .. } => None,
         CallEvent::Command(CallCommand::Hangup) => Some(TimelineEvent::HangupRequested),
         CallEvent::Command(
             CallCommand::BlindTransfer { .. } | CallCommand::AttendedTransfer { .. },
@@ -162,7 +164,7 @@ fn timeline_action(action: &CallAction) -> Option<TimelineEvent> {
             Some(TimelineEvent::TransferSent)
         }
         CallAction::Ended(_) => Some(TimelineEvent::CallEnded),
-        CallAction::SelectBranch { .. } => None,
+        CallAction::SelectBranch { .. } | CallAction::ApplySessionModification { .. } => None,
     }
 }
 

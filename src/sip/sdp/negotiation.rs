@@ -42,6 +42,37 @@ pub struct RtpMediaOffer {
     codecs: Vec<Codec>,
     direction: Direction,
     packetization: Packetization,
+    telephone_event: Option<NegotiatedTelephoneEvent>,
+}
+
+/// Negotiated RFC 4733 telephone-event mapping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NegotiatedTelephoneEvent {
+    payload_type: PayloadType,
+    clock_rate: u32,
+    allowed_events: [u64; 4],
+}
+
+impl NegotiatedTelephoneEvent {
+    /// Returns dynamically negotiated payload type.
+    #[must_use]
+    pub const fn payload_type(&self) -> PayloadType {
+        self.payload_type
+    }
+
+    /// Returns RTP event clock rate.
+    #[must_use]
+    pub const fn clock_rate(&self) -> u32 {
+        self.clock_rate
+    }
+
+    /// Returns whether one event code was offered by the remote endpoint.
+    #[must_use]
+    pub const fn allows(&self, event: u8) -> bool {
+        let word = event as usize / 64;
+        let bit = event as usize % 64;
+        self.allowed_events[word] & (1_u64 << bit) != 0
+    }
 }
 
 /// Negotiated network packetization, independent of 10 ms AI frames.
@@ -164,6 +195,39 @@ impl RtpMediaOffer {
         if maximum_packet_time_ms.is_some_and(|maximum| packet_time_ms > maximum) {
             return Err(NegotiationError::PacketTimeExceedsMaximum);
         }
+        let telephone_event = codecs
+            .iter()
+            .find(|codec| codec.name().is("telephone-event"))
+            .map(|codec| {
+                let mut allowed_events = standard_telephone_events();
+                let mut found = false;
+                for line in section.lines() {
+                    if line.field() != SdpField::Attribute {
+                        continue;
+                    }
+                    let Some(value) = line.value().strip_prefix("fmtp:") else {
+                        continue;
+                    };
+                    let Some((payload, parameters)) = value.split_once([' ', '\t']) else {
+                        continue;
+                    };
+                    if payload.parse::<u8>().ok() != Some(codec.payload_type().get()) {
+                        continue;
+                    }
+                    if found {
+                        return Err(NegotiationError::DuplicateTelephoneEventFormat);
+                    }
+                    allowed_events = parse_telephone_events(parameters.trim())?;
+                    found = true;
+                }
+                Ok(NegotiatedTelephoneEvent {
+                    payload_type: codec.payload_type(),
+                    clock_rate: codec.clock_rate(),
+                    allowed_events,
+                })
+            })
+            .transpose()?;
+
         Ok(Self {
             media_type: media.media().clone(),
             protocol: media.protocol().clone(),
@@ -174,6 +238,7 @@ impl RtpMediaOffer {
                 packet_time_ms,
                 maximum_packet_time_ms,
             },
+            telephone_event,
         })
     }
 
@@ -213,6 +278,12 @@ impl RtpMediaOffer {
         self.packetization
     }
 
+    /// Returns the offered telephone-event mapping when present.
+    #[must_use]
+    pub const fn telephone_event(&self) -> Option<&NegotiatedTelephoneEvent> {
+        self.telephone_event.as_ref()
+    }
+
     /// Selects a codec using local preference order.
     ///
     /// The selected mapping retains the offered payload type. When
@@ -239,17 +310,23 @@ impl RtpMediaOffer {
             return Err(NegotiationError::NoLocalCodecs);
         }
         for local in local_preference {
-            if let Some(offered) = self
-                .codecs
-                .iter()
-                .find(|offered| offered.is_compatible_with(local))
-            {
+            if local.name().is("telephone-event") {
+                continue;
+            }
+            if let Some(offered) = self.codecs.iter().find(|offered| {
+                !offered.name().is("telephone-event") && offered.is_compatible_with(local)
+            }) {
                 return Ok(NegotiatedMedia {
                     codec: offered.clone(),
                     direction: self.direction.answer(local_can_send, local_can_receive),
                     protocol: self.protocol.clone(),
                     remote_port: self.port,
                     packetization: self.packetization,
+                    telephone_event: self
+                        .telephone_event
+                        .as_ref()
+                        .filter(|event| event.clock_rate == offered.clock_rate())
+                        .cloned(),
                 });
             }
         }
@@ -265,6 +342,7 @@ pub struct NegotiatedMedia {
     protocol: TransportProtocol,
     remote_port: u16,
     packetization: Packetization,
+    telephone_event: Option<NegotiatedTelephoneEvent>,
 }
 
 impl NegotiatedMedia {
@@ -297,6 +375,12 @@ impl NegotiatedMedia {
     pub const fn packetization(&self) -> Packetization {
         self.packetization
     }
+
+    /// Returns negotiated RFC 4733 event stream when compatible with audio clock.
+    #[must_use]
+    pub const fn telephone_event(&self) -> Option<&NegotiatedTelephoneEvent> {
+        self.telephone_event.as_ref()
+    }
 }
 
 /// RTP media negotiation failure.
@@ -327,6 +411,10 @@ pub enum NegotiationError {
     InvalidPacketTime,
     /// `ptime` exceeded advertised `maxptime`.
     PacketTimeExceedsMaximum,
+    /// More than one `fmtp` described the negotiated telephone-event payload.
+    DuplicateTelephoneEventFormat,
+    /// Telephone-event `fmtp` contained malformed or empty event ranges.
+    InvalidTelephoneEventFormat,
     /// Media was rejected with port zero.
     RejectedMedia,
     /// Policy required a secure RTP profile.
@@ -337,6 +425,46 @@ pub enum NegotiationError {
     NoCompatibleCodec,
     /// Bounded allocation failed.
     AllocationFailed,
+}
+
+const fn standard_telephone_events() -> [u64; 4] {
+    [0xffff, 0, 0, 0]
+}
+
+fn parse_telephone_events(input: &str) -> Result<[u64; 4], NegotiationError> {
+    if input.is_empty() {
+        return Err(NegotiationError::InvalidTelephoneEventFormat);
+    }
+    let mut allowed = [0_u64; 4];
+    for item in input.split(',') {
+        if item.is_empty() {
+            return Err(NegotiationError::InvalidTelephoneEventFormat);
+        }
+        let (first, last) = match item.split_once('-') {
+            Some((first, last)) => (
+                first
+                    .parse::<u8>()
+                    .map_err(|_| NegotiationError::InvalidTelephoneEventFormat)?,
+                last.parse::<u8>()
+                    .map_err(|_| NegotiationError::InvalidTelephoneEventFormat)?,
+            ),
+            None => {
+                let value = item
+                    .parse::<u8>()
+                    .map_err(|_| NegotiationError::InvalidTelephoneEventFormat)?;
+                (value, value)
+            }
+        };
+        if first > last {
+            return Err(NegotiationError::InvalidTelephoneEventFormat);
+        }
+        for event in first..=last {
+            let word = event as usize / 64;
+            let bit = event as usize % 64;
+            allowed[word] |= 1_u64 << bit;
+        }
+    }
+    Ok(allowed)
 }
 
 impl fmt::Display for NegotiationError {
@@ -445,6 +573,31 @@ m=audio 40000 RTP/AVP 0\r\na=sendonly\r\na=recvonly\r\n";
             RtpMediaOffer::from_section(&document.media_sections()[0], Direction::SendRecv),
             Err(NegotiationError::DuplicateDirection)
         );
+    }
+
+    #[test]
+    fn negotiates_dynamic_telephone_event_without_selecting_it_as_audio() {
+        let document = parse(
+            b"v=0\r\no=- 1 1 IN IP4 host\r\ns=x\r\nt=0 0\r\n\
+m=audio 4000 RTP/AVP 101 0\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=fmtp:101 0-11,15\r\n",
+        )
+        .unwrap_or_else(|_| panic!("SDP"));
+        let offer = RtpMediaOffer::from_section(&document.media_sections()[0], Direction::SendRecv)
+            .unwrap_or_else(|_| panic!("offer"));
+        let local = Codec::from_bytes(b"0 PCMU/8000").unwrap_or_else(|_| panic!("codec"));
+        let negotiated = offer
+            .negotiate(&[local], true, true, false)
+            .unwrap_or_else(|_| panic!("negotiate"));
+        assert_eq!(negotiated.codec().payload_type().get(), 0);
+        let event = negotiated
+            .telephone_event()
+            .unwrap_or_else(|| panic!("telephone-event"));
+        assert_eq!(event.payload_type().get(), 101);
+        assert!(event.allows(5));
+        assert!(!event.allows(12));
+        assert!(event.allows(15));
     }
 
     #[test]

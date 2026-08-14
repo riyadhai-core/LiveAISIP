@@ -174,6 +174,9 @@ impl ClientTransaction {
         let state = next_machine.on_response(status)?;
         let non_2xx_invite = self.machine.kind() == TransactionKind::Invite
             && (300..=699).contains(&status.as_u16());
+        let late_forked_success = self.machine.kind() == TransactionKind::Invite
+            && previous == ClientState::Completed
+            && (200..=299).contains(&status.as_u16());
 
         let ack = if non_2xx_invite {
             if let Some(bytes) = &self.non_2xx_ack {
@@ -241,6 +244,16 @@ impl ClientTransaction {
                 actions.push(Action::Terminate);
             }
         }
+        if late_forked_success {
+            // Replace Timer D with RFC 6026 Timer M. A stale generation-fenced
+            // Timer D callback is harmless, but explicit cancellation keeps
+            // scheduler occupancy bounded and diagnostics accurate.
+            actions.push(Action::Cancel(Timer::Linger));
+            actions.push(Action::Schedule {
+                timer: Timer::Linger,
+                after: self.profile.invite_timeout(),
+            });
+        }
         Ok(actions)
     }
 
@@ -296,6 +309,24 @@ impl ClientTransaction {
     #[must_use]
     pub const fn key(&self) -> &TransactionKey {
         &self.key
+    }
+
+    /// Returns transaction method family.
+    #[must_use]
+    pub const fn kind(&self) -> TransactionKind {
+        self.machine.kind()
+    }
+
+    /// Returns compact failure ACK bytes when one was constructed.
+    #[must_use]
+    pub fn retained_failure_ack(&self) -> Option<Arc<[u8]>> {
+        self.non_2xx_ack.as_ref().map(Arc::clone)
+    }
+
+    /// Returns Timer-M-sized late response retention interval.
+    #[must_use]
+    pub const fn completion_retention(&self) -> Duration {
+        self.profile.invite_timeout()
     }
 
     /// Returns current client state.
@@ -684,5 +715,34 @@ Call-ID: one@example.com\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
                 .iter()
                 .all(|action| !matches!(action, Action::SendAck(_)))
         );
+    }
+
+    #[test]
+    fn late_forked_success_after_failure_enters_timer_m_window() {
+        let Ok(mut transaction) = ClientTransaction::new(request(), false, TimerConfig::default())
+        else {
+            panic!("transaction")
+        };
+        assert!(transaction.start().is_ok());
+        assert!(transaction.on_response(&response(486, "Busy Here")).is_ok());
+        assert_eq!(transaction.state(), ClientState::Completed);
+
+        let actions = transaction
+            .on_response(&response(200, "OK"))
+            .unwrap_or_else(|_| panic!("late success"));
+        assert_eq!(transaction.state(), ClientState::Accepted);
+        assert!(matches!(actions.first(), Some(Action::DeliverResponse)));
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::Cancel(Timer::Linger)))
+        );
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::Schedule {
+                timer: Timer::Linger,
+                ..
+            }
+        )));
     }
 }

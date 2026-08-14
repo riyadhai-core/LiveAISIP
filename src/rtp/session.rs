@@ -24,6 +24,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use super::dtmf::{TelephoneEvent, TelephoneEventError};
 use super::liveness::{MediaLiveness, MediaLivenessError};
 use super::packet::rtcp::{CompoundPolicy, CompoundRtcp, CompoundRtcpError, Goodbye, RtcpPacket};
 use super::packet::rtp::{RtpPacket, RtpPacketError};
@@ -33,13 +34,85 @@ use super::rtcp_scheduler::{
 };
 use super::security::{MediaSecurityError, MediaSecurityPolicy, PacketProtection};
 use super::source::{RemoteSourceTracker, SourceObservation, SourcePolicy};
-use super::state::{ReceivePacketOutcome, RtpReceiveConfig, RtpReceiveState, RtpStateError};
+use super::state::{
+    AuxiliaryPacketOutcome, ReceivePacketOutcome, RtpReceiveConfig, RtpReceiveState, RtpStateError,
+};
+use super::stats::reorder::{DelayedLossSnapshot, DelayedLossTracker};
 use super::transport::socket::Component;
 use super::transport::symmetric::{SymmetricEndpoints, SymmetricError, SymmetricObservation};
 use super::transport::udp::{DatagramClassification, DatagramClassifier};
 
 /// Default packets waiting for immediate `NetEq` insertion.
 pub const DEFAULT_INGRESS_QUEUE_PACKETS: usize = 128;
+
+/// Negotiated RFC 4733 stream descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TelephoneEventConfig {
+    payload_type: u8,
+    clock_rate: u32,
+    allowed_events: [u64; 4],
+}
+
+impl TelephoneEventConfig {
+    /// Creates the common keypad event set 0 through 15.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid payload types or a zero RTP clock rate.
+    pub const fn standard(payload_type: u8, clock_rate: u32) -> Result<Self, RtpSessionError> {
+        if payload_type > 127 || clock_rate == 0 {
+            return Err(RtpSessionError::InvalidTelephoneEventConfig);
+        }
+        Ok(Self {
+            payload_type,
+            clock_rate,
+            allowed_events: [0xffff, 0, 0, 0],
+        })
+    }
+
+    /// Creates an event descriptor from a negotiated 256-bit allow set.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid payload types, a zero clock rate, or an empty event set.
+    pub const fn new(
+        payload_type: u8,
+        clock_rate: u32,
+        allowed_events: [u64; 4],
+    ) -> Result<Self, RtpSessionError> {
+        if payload_type > 127
+            || clock_rate == 0
+            || (allowed_events[0] | allowed_events[1] | allowed_events[2] | allowed_events[3]) == 0
+        {
+            return Err(RtpSessionError::InvalidTelephoneEventConfig);
+        }
+        Ok(Self {
+            payload_type,
+            clock_rate,
+            allowed_events,
+        })
+    }
+
+    /// Returns negotiated dynamic payload type.
+    #[must_use]
+    pub const fn payload_type(self) -> u8 {
+        self.payload_type
+    }
+
+    /// Returns negotiated event timestamp clock.
+    #[must_use]
+    pub const fn clock_rate(self) -> u32 {
+        self.clock_rate
+    }
+
+    /// Returns whether one event code was negotiated.
+    #[must_use]
+    pub const fn allows(self, event: u8) -> bool {
+        let word = event as usize / 64;
+        let bit = event as usize % 64;
+        self.allowed_events[word] & (1_u64 << bit) != 0
+    }
+}
 
 /// Owned packet metadata and payload admitted for `NetEq` insertion.
 pub struct NetEqPacket {
@@ -113,6 +186,8 @@ pub enum RtpIngressOutcome {
     SourceSwitched,
     /// Packet failed payload, SSRC or sequence admission.
     StreamRejected(ReceivePacketOutcome),
+    /// Negotiated auxiliary payload failed shared source/sequence admission.
+    AuxiliaryRejected(AuxiliaryPacketOutcome),
     /// Packet entered the bounded `NetEq` queue.
     Queued {
         /// Symmetric endpoint observation after stream validation.
@@ -120,6 +195,13 @@ pub enum RtpIngressOutcome {
     },
     /// Packet was valid but the full ingress queue dropped it.
     QueueDropped,
+    /// Negotiated telephone-event was parsed outside the audio/NetEq path.
+    TelephoneEvent {
+        /// Exact RFC 4733 payload.
+        event: TelephoneEvent,
+        /// Symmetric endpoint observation after authentication and source validation.
+        endpoint: SymmetricObservation,
+    },
 }
 
 /// Result of one RTCP datagram at the session boundary.
@@ -153,6 +235,8 @@ pub struct RtpSession {
     source_resets: u64,
     rtcp: Option<RtcpScheduler>,
     rtcp_policy: CompoundPolicy,
+    telephone_event: Option<TelephoneEventConfig>,
+    delayed_loss: DelayedLossTracker,
 }
 
 impl RtpSession {
@@ -183,7 +267,30 @@ impl RtpSession {
             source_resets: 0,
             rtcp: None,
             rtcp_policy: CompoundPolicy::Strict,
+            telephone_event: None,
+            delayed_loss: DelayedLossTracker::new(),
         })
+    }
+
+    /// Installs negotiated telephone-event routing.
+    ///
+    /// The event payload type must differ from audio and use the same RTP clock
+    /// domain so both streams can safely share sequence/timestamp machinery.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an event mapping that collides with audio or uses another clock.
+    pub fn configure_telephone_event(
+        &mut self,
+        config: TelephoneEventConfig,
+    ) -> Result<(), RtpSessionError> {
+        if config.payload_type() == self.receive_config.payload_type()
+            || config.clock_rate() != self.receive_config.clock_rate().get()
+        {
+            return Err(RtpSessionError::InvalidTelephoneEventConfig);
+        }
+        self.telephone_event = Some(config);
+        Ok(())
     }
 
     /// Installs or atomically replaces session-owned RTCP scheduling state.
@@ -241,6 +348,28 @@ impl RtpSession {
             SourceObservation::Current => {}
         }
 
+        if let Some(config) = self.telephone_event
+            && header.payload_type() == config.payload_type()
+        {
+            let auxiliary = self.receive.observe_auxiliary(&packet);
+            if !auxiliary.admitted() {
+                return Ok(RtpIngressOutcome::AuxiliaryRejected(auxiliary));
+            }
+            let event = TelephoneEvent::parse(packet.payload()).map_err(RtpSessionError::Dtmf)?;
+            if !config.allows(event.code().as_raw()) {
+                return Err(RtpSessionError::TelephoneEventNotNegotiated);
+            }
+            self.delayed_loss.observe(header.sequence_number());
+            let endpoint = self
+                .endpoints
+                .observe_validated_source(Component::Rtp, network_source)
+                .map_err(RtpSessionError::Endpoint)?;
+            self.liveness
+                .note_valid_receive(arrival)
+                .map_err(RtpSessionError::Liveness)?;
+            return Ok(RtpIngressOutcome::TelephoneEvent { event, endpoint });
+        }
+
         let stream = self
             .receive
             .observe(&packet, arrival)
@@ -248,6 +377,7 @@ impl RtpSession {
         if !stream.admitted() {
             return Ok(RtpIngressOutcome::StreamRejected(stream));
         }
+        self.delayed_loss.observe(header.sequence_number());
         let endpoint = self
             .endpoints
             .observe_validated_source(Component::Rtp, network_source)
@@ -378,6 +508,12 @@ impl RtpSession {
         self.source_resets
     }
 
+    /// Returns reorder-window loss observability independent of RTCP counters.
+    #[must_use]
+    pub fn delayed_loss(&self) -> DelayedLossSnapshot {
+        self.delayed_loss.snapshot()
+    }
+
     fn rebind_receive_state(&mut self, ssrc: u32) -> Result<(), RtpSessionError> {
         let config = RtpReceiveConfig::new(
             self.receive_config.payload_type(),
@@ -388,6 +524,7 @@ impl RtpSession {
         self.receive = RtpReceiveState::new(config);
         self.ingress.clear();
         self.source_resets = self.source_resets.saturating_add(1);
+        self.delayed_loss = DelayedLossTracker::new();
         Ok(())
     }
 }
@@ -445,6 +582,12 @@ pub enum RtpSessionError {
     Rtcp(RtcpSchedulerError),
     /// RTCP was used before session configuration.
     RtcpNotConfigured,
+    /// Telephone-event mapping conflicted with negotiated audio.
+    InvalidTelephoneEventConfig,
+    /// RFC 4733 payload syntax was invalid.
+    Dtmf(TelephoneEventError),
+    /// Event code was not present in negotiated SDP `fmtp`.
+    TelephoneEventNotNegotiated,
     /// Packet payload ownership allocation failed.
     AllocationFailed,
 }
@@ -466,7 +609,11 @@ impl StdError for RtpSessionError {
             Self::Queue(error) => Some(error),
             Self::CompoundRtcp(error) => Some(error),
             Self::Rtcp(error) => Some(error),
-            Self::AllocationFailed | Self::RtcpNotConfigured => None,
+            Self::Dtmf(error) => Some(error),
+            Self::AllocationFailed
+            | Self::RtcpNotConfigured
+            | Self::InvalidTelephoneEventConfig
+            | Self::TelephoneEventNotNegotiated => None,
         }
     }
 }
@@ -476,7 +623,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
-    use super::{RtcpIngressOutcome, RtpIngressOutcome, RtpSession};
+    use super::{RtcpIngressOutcome, RtpIngressOutcome, RtpSession, TelephoneEventConfig};
     use crate::rtp::clock::RtpClockRate;
     use crate::rtp::liveness::MediaLiveness;
     use crate::rtp::packet::rtcp::{
@@ -536,6 +683,17 @@ mod tests {
         bytes
     }
 
+    fn telephone_event_packet(sequence: u16) -> [u8; 16] {
+        let mut bytes = [0_u8; 16];
+        bytes[0] = 0x80;
+        bytes[1] = 101;
+        bytes[2..4].copy_from_slice(&sequence.to_be_bytes());
+        bytes[4..8].copy_from_slice(&160_u32.to_be_bytes());
+        bytes[8..12].copy_from_slice(&7_u32.to_be_bytes());
+        bytes[12..16].copy_from_slice(&[5, 0x80 | 10, 0, 160]);
+        bytes
+    }
+
     #[test]
     fn secure_session_refuses_plain_packet_without_downgrade() {
         let mut session = session(MediaSecurityPolicy::SecureRequired);
@@ -582,6 +740,40 @@ mod tests {
             ),
             Ok(RtpIngressOutcome::ClassifiedOut(_))
         ));
+    }
+
+    #[test]
+    fn negotiated_telephone_event_never_enters_neteq_audio_queue() {
+        let mut session = session(MediaSecurityPolicy::PlainAllowed);
+        session
+            .configure_telephone_event(
+                TelephoneEventConfig::standard(101, 8_000)
+                    .unwrap_or_else(|_| panic!("event config")),
+            )
+            .unwrap_or_else(|_| panic!("configure"));
+        for sequence in 1..=2 {
+            assert!(
+                session
+                    .ingest_rtp(
+                        address(20_000),
+                        &packet(sequence),
+                        Duration::from_millis(u64::from(sequence) * 10),
+                        PacketProtection::Plain,
+                    )
+                    .is_ok()
+            );
+        }
+        let depth = session.ingress_diagnostics().depth;
+        assert!(matches!(
+            session.ingest_rtp(
+                address(20_000),
+                &telephone_event_packet(3),
+                Duration::from_millis(30),
+                PacketProtection::Plain,
+            ),
+            Ok(RtpIngressOutcome::TelephoneEvent { event, .. }) if event.digit().is_some()
+        ));
+        assert_eq!(session.ingress_diagnostics().depth, depth);
     }
 
     #[test]

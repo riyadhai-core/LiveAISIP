@@ -21,6 +21,8 @@
 
 pub mod jitter;
 pub mod loss;
+/// Constant-memory reorder-window loss observability.
+pub mod reorder;
 pub mod rtt;
 pub mod sequence;
 

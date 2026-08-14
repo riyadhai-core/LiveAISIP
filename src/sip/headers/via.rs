@@ -376,6 +376,47 @@ impl ViaEntry {
         Ok(())
     }
 
+    /// Applies RFC 3261 `received` and RFC 3581 `rport` response stamping from
+    /// the authenticated transport source.
+    ///
+    /// Existing wire-supplied `received` information is never trusted: it is
+    /// removed and reconstructed from transport truth when required. A bare
+    /// `rport` request is replaced with the observed source port; an existing
+    /// valued `rport` is also overwritten so callers cannot select an
+    /// arbitrary response destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns the normal bounded parameter error if adding `received` would
+    /// exceed the per-hop parameter limit.
+    pub fn stamp_response_source(
+        &mut self,
+        source: std::net::SocketAddr,
+    ) -> Result<(), ParseError> {
+        self.parameters
+            .retain(|parameter| !matches!(parameter, ViaParameter::Received(_)));
+
+        let source_differs = match (&self.sent_by_host, source.ip()) {
+            (Host::Ipv4(sent_by), IpAddr::V4(source)) => *sent_by != source,
+            (Host::Ipv6(sent_by), IpAddr::V6(source)) => *sent_by != source,
+            (Host::Domain(_), _)
+            | (Host::Ipv4(_), IpAddr::V6(_))
+            | (Host::Ipv6(_), IpAddr::V4(_)) => true,
+        };
+        if source_differs {
+            self.push_parameter(ViaParameter::Received(source.ip()))?;
+        }
+
+        if let Some(parameter) = self
+            .parameters
+            .iter_mut()
+            .find(|parameter| matches!(parameter, ViaParameter::RPort(_)))
+        {
+            *parameter = ViaParameter::RPort(RPort::Value(source.port()));
+        }
+        Ok(())
+    }
+
     /// Returns the number of Via parameters.
     #[must_use]
     pub fn parameter_count(&self) -> usize {

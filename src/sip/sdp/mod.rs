@@ -31,7 +31,7 @@ pub mod types;
 pub use codec::{Codec, CodecError, CodecName, PayloadType};
 pub use direction::{Direction, DirectionParseError};
 pub use media::{MediaError, MediaFormat, MediaLine, MediaType, TransportProtocol};
-pub use negotiation::{NegotiatedMedia, NegotiationError, RtpMediaOffer};
+pub use negotiation::{NegotiatedMedia, NegotiatedTelephoneEvent, NegotiationError, RtpMediaOffer};
 pub use offer_answer::{OfferAnswer, OfferAnswerError, OfferAnswerState, OfferToken};
 pub use parser::{MediaSection, SdpDocument, SdpParseError, parse};
 pub use serializer::{SdpSerializeError, serialize, serialized_len};

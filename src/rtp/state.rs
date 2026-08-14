@@ -120,6 +120,31 @@ pub enum ReceivePacketOutcome {
     },
 }
 
+/// Sequence/source admission for an auxiliary RTP payload such as RFC 4733.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuxiliaryPacketOutcome {
+    /// Packet SSRC differs from the active media source.
+    SourceRejected,
+    /// Shared RTP sequence validation withheld the packet.
+    SequenceRejected {
+        /// Detailed shared sequence result.
+        disposition: SequenceDisposition,
+    },
+    /// Packet participates in shared sequence/loss accounting but not audio jitter.
+    Admitted {
+        /// Detailed shared sequence result.
+        disposition: SequenceDisposition,
+    },
+}
+
+impl AuxiliaryPacketOutcome {
+    /// Returns whether auxiliary payload parsing may continue.
+    #[must_use]
+    pub const fn admitted(self) -> bool {
+        matches!(self, Self::Admitted { .. })
+    }
+}
+
 impl ReceivePacketOutcome {
     /// Returns whether payload may be forwarded to `NetEQ`.
     #[must_use]
@@ -182,6 +207,31 @@ impl RtpReceiveState {
             rejected_sequence: 0,
             last_sender_report: None,
         }
+    }
+
+    /// Admits a negotiated auxiliary payload into the same RTP sequence space.
+    ///
+    /// Telephone-event packets must affect expected/lost sequence accounting,
+    /// but their constant event timestamps must not pollute audio interarrival
+    /// jitter. Payload-type dispatch is performed by [`crate::rtp::session::RtpSession`].
+    #[must_use]
+    pub fn observe_auxiliary(&mut self, packet: &RtpPacket<'_>) -> AuxiliaryPacketOutcome {
+        let header = packet.header();
+        if self.bound_ssrc.is_some_and(|ssrc| ssrc != header.ssrc()) {
+            self.rejected_source = self.rejected_source.saturating_add(1);
+            return AuxiliaryPacketOutcome::SourceRejected;
+        }
+        self.bound_ssrc.get_or_insert(header.ssrc());
+        let disposition = self.sequence.observe(header.sequence_number());
+        if !disposition.accepted() {
+            self.rejected_sequence = self.rejected_sequence.saturating_add(1);
+            return AuxiliaryPacketOutcome::SequenceRejected { disposition };
+        }
+        self.admitted_packets = self.admitted_packets.saturating_add(1);
+        self.admitted_payload_bytes = self
+            .admitted_payload_bytes
+            .saturating_add(packet.payload().len() as u64);
+        AuxiliaryPacketOutcome::Admitted { disposition }
     }
 
     /// Validates and accounts one parsed RTP packet.

@@ -45,3 +45,9 @@ pub mod stream;
 
 /// Bounded RFC 3263 destination planning over validated DNS answers.
 pub mod resolver;
+
+/// Transport-truth metadata and exact reliable-flow routing.
+pub mod flow;
+
+/// Wire-commit-aware bounded destination failover.
+pub mod failover;

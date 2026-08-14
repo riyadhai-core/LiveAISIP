@@ -31,7 +31,10 @@ pub mod state;
 pub use core::{Dialog, DialogError, DialogSequenceRole};
 pub use id::{DialogId, DialogIdError, TagRole};
 pub use manager::{DialogManager, DialogManagerError, DialogToken};
-pub use reliable::{PrackDisposition, PrackTracker, ReliableError};
+pub use reliable::{
+    PrackDisposition, PrackTracker, RackIdentity, ReliableError, ReliableProvisionalServer,
+    ReliableServerAction, ReliableServerError,
+};
 pub use route::{DialogRouteError, RouteSet, RoutingPlan};
 pub use session_timer::{Refresher, SessionTimer, SessionTimerAction, SessionTimerError};
 pub use state::{DialogState, DialogStateError};

@@ -66,6 +66,15 @@ impl CallLifecycle {
             CallEvent::SignalingTimedOut => Ok(self.end(CallEndReason::SignalingTimeout)),
             CallEvent::MediaTimedOut => Ok(self.end(CallEndReason::MediaTimeout)),
             CallEvent::TransportFailed => Ok(self.end(CallEndReason::TransportFailure)),
+            CallEvent::SessionModification { method, has_offer }
+                if self.state == CallState::Established =>
+            {
+                Ok(vec![CallAction::ApplySessionModification {
+                    method,
+                    has_offer,
+                }])
+            }
+            CallEvent::SessionModification { .. } => Err(LifecycleError::InvalidEvent),
         }
     }
 
@@ -270,7 +279,7 @@ impl StdError for LifecycleError {
 #[cfg(test)]
 mod tests {
     use super::CallLifecycle;
-    use crate::call::events::{CallAction, CallCommand, CallEvent};
+    use crate::call::events::{CallAction, CallCommand, CallEvent, SessionModificationMethod};
     use crate::call::leg::DialogBranchId;
     use crate::call::state::{CallEndReason, CallState};
 
@@ -349,6 +358,43 @@ mod tests {
                 },
                 CallAction::SendBye { branch: second }
             ])
+        );
+    }
+
+    #[test]
+    fn established_session_modification_preserves_invite_or_update_method() {
+        let mut call = started();
+        let selected = branch("selected");
+        assert!(
+            call.handle(CallEvent::InviteAccepted { branch: selected })
+                .is_ok()
+        );
+        for method in [
+            SessionModificationMethod::Invite,
+            SessionModificationMethod::Update,
+        ] {
+            assert_eq!(
+                call.handle(CallEvent::SessionModification {
+                    method,
+                    has_offer: true,
+                }),
+                Ok(vec![CallAction::ApplySessionModification {
+                    method,
+                    has_offer: true,
+                }])
+            );
+        }
+    }
+
+    #[test]
+    fn session_modification_is_rejected_before_dialog_establishment() {
+        let mut call = started();
+        assert_eq!(
+            call.handle(CallEvent::SessionModification {
+                method: SessionModificationMethod::Update,
+                has_offer: false,
+            }),
+            Err(super::LifecycleError::InvalidEvent)
         );
     }
 }

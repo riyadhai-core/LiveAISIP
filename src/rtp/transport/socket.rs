@@ -179,6 +179,72 @@ pub struct DatagramBuffer {
     maximum: usize,
 }
 
+/// Permanent per-call packet scratch storage for receive, RTP serialization,
+/// and protected SRTP/SRTCP output.
+///
+/// The media worker allocates this once before entering its 10 ms loop. Hot
+/// paths borrow fixed storage and never create per-packet vectors.
+pub struct MediaPacketScratch {
+    receive: DatagramBuffer,
+    rtp_output: Box<[u8]>,
+    protected_output: Box<[u8]>,
+}
+
+impl MediaPacketScratch {
+    /// Allocates all packet storage transactionally at call setup.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid bounds and allocation failure.
+    pub fn new(maximum_datagram_bytes: usize) -> Result<Self, SocketError> {
+        let receive = DatagramBuffer::new(maximum_datagram_bytes)?;
+        let rtp_output = allocate_zeroed(maximum_datagram_bytes)?;
+        let protected_output = allocate_zeroed(maximum_datagram_bytes)?;
+        Ok(Self {
+            receive,
+            rtp_output,
+            protected_output,
+        })
+    }
+
+    /// Returns reusable receive storage.
+    #[must_use]
+    pub fn receive(&mut self) -> &mut DatagramBuffer {
+        &mut self.receive
+    }
+
+    /// Returns reusable clear RTP/RTCP serialization storage.
+    #[must_use]
+    pub fn rtp_output(&mut self) -> &mut [u8] {
+        &mut self.rtp_output
+    }
+
+    /// Returns reusable SRTP/SRTCP output storage.
+    #[must_use]
+    pub fn protected_output(&mut self) -> &mut [u8] {
+        &mut self.protected_output
+    }
+}
+
+impl fmt::Debug for MediaPacketScratch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MediaPacketScratch")
+            .field("maximum", &self.receive.maximum())
+            .finish_non_exhaustive()
+    }
+}
+
+fn allocate_zeroed(length: usize) -> Result<Box<[u8]>, SocketError> {
+    SocketConfig::new(length)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| SocketError::AllocationFailed)?;
+    bytes.resize(length, 0);
+    Ok(bytes.into_boxed_slice())
+}
+
 impl DatagramBuffer {
     /// Allocates one bounded receive buffer plus an oversize sentinel byte.
     ///
@@ -655,8 +721,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Component, DatagramBuffer, MAX_MEDIA_DATAGRAM_BYTES, MediaSocketPair, SocketConfig,
-        SocketError,
+        Component, DatagramBuffer, MAX_MEDIA_DATAGRAM_BYTES, MediaPacketScratch, MediaSocketPair,
+        SocketConfig, SocketError,
     };
     use crate::rtp::transport::allocator::PortPool;
 
@@ -940,5 +1006,21 @@ mod tests {
         assert!(!debug.contains("127.0.0.1"));
         let pair_debug = format!("{pair:?}");
         assert!(!pair_debug.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn permanent_packet_scratch_reuses_all_allocations() {
+        let Ok(mut scratch) = MediaPacketScratch::new(2_048) else {
+            panic!("scratch")
+        };
+        let receive_pointer = scratch.receive().bytes.as_ptr();
+        let rtp_pointer = scratch.rtp_output().as_ptr();
+        let protected_pointer = scratch.protected_output().as_ptr();
+
+        for _ in 0..16 {
+            assert_eq!(scratch.receive().bytes.as_ptr(), receive_pointer);
+            assert_eq!(scratch.rtp_output().as_ptr(), rtp_pointer);
+            assert_eq!(scratch.protected_output().as_ptr(), protected_pointer);
+        }
     }
 }

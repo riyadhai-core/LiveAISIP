@@ -26,6 +26,92 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::net::SocketAddr;
 
+/// Per-generation media worker lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaLifecycle {
+    /// Packet, timer and AI work is accepted.
+    Active,
+    /// New AI transmit audio is fenced while committed work drains.
+    Draining,
+    /// Every media resource is retired.
+    Closed,
+}
+
+/// Generation token attached to packet, timer and DSP work.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MediaWorkToken(u64);
+
+impl MediaWorkToken {
+    /// Returns opaque media generation.
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.0
+    }
+}
+
+/// Ordered graceful media shutdown operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaShutdownAction {
+    /// Reject new AI transmit frames.
+    FenceAiTransmit,
+    /// Finish the single already-committed RTP packet.
+    FlushCommittedRtp,
+    /// Emit RTCP BYE while the control socket remains live.
+    SendRtcpBye,
+    /// Stop the deterministic ten-millisecond media clock.
+    StopMediaClock,
+    /// Close `NetEq`, resampler and APM state.
+    CloseDsp,
+    /// Destroy SRTP/SRTCP contexts.
+    DestroySecurityContexts,
+    /// Close bound RTP/RTCP sockets.
+    CloseSockets,
+    /// Release the bound port lease.
+    ReleasePortLease,
+    /// Wake and close native/Python audio queues last.
+    CloseAudioQueues,
+}
+
+/// Builds the one legal media teardown sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaShutdownPlan {
+    has_committed_packet: bool,
+    rtcp_active: bool,
+}
+
+impl MediaShutdownPlan {
+    /// Captures resources that require protocol-visible draining.
+    #[must_use]
+    pub const fn new(has_committed_packet: bool, rtcp_active: bool) -> Self {
+        Self {
+            has_committed_packet,
+            rtcp_active,
+        }
+    }
+
+    /// Returns the deterministic teardown order.
+    #[must_use]
+    pub fn actions(self) -> Vec<MediaShutdownAction> {
+        let mut actions = Vec::with_capacity(9);
+        actions.push(MediaShutdownAction::FenceAiTransmit);
+        if self.has_committed_packet {
+            actions.push(MediaShutdownAction::FlushCommittedRtp);
+        }
+        if self.rtcp_active {
+            actions.push(MediaShutdownAction::SendRtcpBye);
+        }
+        actions.extend([
+            MediaShutdownAction::StopMediaClock,
+            MediaShutdownAction::CloseDsp,
+            MediaShutdownAction::DestroySecurityContexts,
+            MediaShutdownAction::CloseSockets,
+            MediaShutdownAction::ReleasePortLease,
+            MediaShutdownAction::CloseAudioQueues,
+        ]);
+        actions
+    }
+}
+
 /// Immutable active-media generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveMedia {
@@ -59,6 +145,7 @@ pub struct MediaController {
     active: Option<ActiveMedia>,
     next_generation: u64,
     require_secure: bool,
+    lifecycle: MediaLifecycle,
 }
 
 /// Single-owner dialog and media state committed as one reconfiguration.
@@ -131,6 +218,7 @@ impl MediaController {
             active: None,
             next_generation: 1,
             require_secure,
+            lifecycle: MediaLifecycle::Active,
         }
     }
 
@@ -198,6 +286,53 @@ impl MediaController {
         self.active.as_ref()
     }
 
+    /// Returns current worker lifecycle.
+    #[must_use]
+    pub const fn lifecycle(&self) -> MediaLifecycle {
+        self.lifecycle
+    }
+
+    /// Returns a generation token only while media accepts new work.
+    #[must_use]
+    pub fn work_token(&self) -> Option<MediaWorkToken> {
+        (self.lifecycle == MediaLifecycle::Active)
+            .then(|| {
+                self.active
+                    .as_ref()
+                    .map(|media| MediaWorkToken(media.generation))
+            })
+            .flatten()
+    }
+
+    /// Checks that queued work still belongs to active media.
+    #[must_use]
+    pub fn accepts(&self, token: MediaWorkToken) -> bool {
+        self.lifecycle == MediaLifecycle::Active
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|media| media.generation == token.0)
+    }
+
+    /// Fences new work while preserving resources for ordered draining.
+    pub fn begin_draining(&mut self) -> bool {
+        if self.lifecycle != MediaLifecycle::Active {
+            return false;
+        }
+        self.lifecycle = MediaLifecycle::Draining;
+        true
+    }
+
+    /// Marks teardown complete. Repeated close is idempotent.
+    pub fn close(&mut self) -> bool {
+        if self.lifecycle == MediaLifecycle::Closed {
+            return false;
+        }
+        self.lifecycle = MediaLifecycle::Closed;
+        self.active = None;
+        true
+    }
+
     fn validate_media(
         &self,
         media: &NegotiatedMedia,
@@ -217,6 +352,17 @@ impl MediaController {
         negotiated: NegotiatedMedia,
         remote_rtp: SocketAddr,
     ) -> Result<&ActiveMedia, MediaControlError> {
+        if self.lifecycle != MediaLifecycle::Active {
+            return Err(MediaControlError::NotActive);
+        }
+        if self.active.as_ref().is_some_and(|active| {
+            active.negotiated == negotiated && active.remote_rtp == remote_rtp
+        }) {
+            return self
+                .active
+                .as_ref()
+                .ok_or(MediaControlError::InternalInvariant);
+        }
         let generation = self.next_generation;
         self.next_generation = generation
             .checked_add(1)
@@ -245,6 +391,8 @@ pub enum MediaControlError {
     GenerationExhausted,
     /// Active snapshot invariant failed.
     InternalInvariant,
+    /// Media is draining or closed and cannot be reconfigured.
+    NotActive,
 }
 impl fmt::Display for MediaControlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -286,7 +434,10 @@ impl StdError for DialogMediaError {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::media::{DialogMediaOwner, MediaControlError, MediaController};
+    use crate::runtime::media::{
+        DialogMediaOwner, MediaControlError, MediaController, MediaLifecycle, MediaShutdownAction,
+        MediaShutdownPlan,
+    };
     use crate::sip::dialog::{Dialog, DialogId, DialogState, RouteSet};
     use crate::sip::headers::call_id::CallId;
     use crate::sip::parser::uri::parse_str;
@@ -383,6 +534,82 @@ mod tests {
         assert_eq!(
             owner.media().active().map(super::ActiveMedia::generation),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn unchanged_effective_sdp_does_not_rebuild_media_generation() {
+        let mut controller = MediaController::new(false);
+        let endpoint = SocketAddr::from(([192, 0, 2, 1], 4000));
+        let first = controller
+            .begin_local_offer()
+            .and_then(|token| controller.apply_remote_answer(token, media(false), endpoint))
+            .map(super::ActiveMedia::generation)
+            .unwrap_or_else(|_| panic!("first"));
+        let second = controller
+            .begin_local_offer()
+            .and_then(|token| controller.apply_remote_answer(token, media(false), endpoint))
+            .map(super::ActiveMedia::generation)
+            .unwrap_or_else(|_| panic!("second"));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn changed_final_answer_replaces_early_media_and_fences_old_work() {
+        let mut controller = MediaController::new(false);
+        let early_endpoint = SocketAddr::from(([192, 0, 2, 1], 4000));
+        let final_endpoint = SocketAddr::from(([192, 0, 2, 2], 5000));
+        let early = controller
+            .begin_local_offer()
+            .and_then(|token| controller.apply_remote_answer(token, media(false), early_endpoint))
+            .map(super::ActiveMedia::generation)
+            .unwrap_or_else(|_| panic!("early media"));
+        let early_token = controller.work_token().unwrap_or_else(|| panic!("token"));
+        let final_generation = controller
+            .begin_local_offer()
+            .and_then(|token| controller.apply_remote_answer(token, media(false), final_endpoint))
+            .map(super::ActiveMedia::generation)
+            .unwrap_or_else(|_| panic!("final media"));
+
+        assert!(final_generation > early);
+        assert!(!controller.accepts(early_token));
+        assert_eq!(
+            controller.active().map(super::ActiveMedia::remote_rtp),
+            Some(final_endpoint)
+        );
+    }
+
+    #[test]
+    fn generation_fences_stale_work_and_shutdown_order_is_fixed() {
+        let mut controller = MediaController::new(false);
+        let endpoint = SocketAddr::from(([192, 0, 2, 1], 4000));
+        let offer = controller
+            .begin_local_offer()
+            .unwrap_or_else(|_| panic!("offer"));
+        controller
+            .apply_remote_answer(offer, media(false), endpoint)
+            .unwrap_or_else(|_| panic!("activate"));
+        let token = controller.work_token().unwrap_or_else(|| panic!("token"));
+        assert!(controller.accepts(token));
+        assert!(controller.begin_draining());
+        assert_eq!(controller.lifecycle(), MediaLifecycle::Draining);
+        assert!(!controller.accepts(token));
+        assert!(controller.close());
+        assert!(!controller.close());
+
+        assert_eq!(
+            MediaShutdownPlan::new(true, true).actions(),
+            vec![
+                MediaShutdownAction::FenceAiTransmit,
+                MediaShutdownAction::FlushCommittedRtp,
+                MediaShutdownAction::SendRtcpBye,
+                MediaShutdownAction::StopMediaClock,
+                MediaShutdownAction::CloseDsp,
+                MediaShutdownAction::DestroySecurityContexts,
+                MediaShutdownAction::CloseSockets,
+                MediaShutdownAction::ReleasePortLease,
+                MediaShutdownAction::CloseAudioQueues,
+            ]
         );
     }
 }

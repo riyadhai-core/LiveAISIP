@@ -31,6 +31,8 @@ use std::time::Duration;
 pub const MAX_ADMISSION_CAPACITY: usize = 1_000_000;
 /// Maximum remote target cooldowns retained.
 pub const MAX_RETRY_SUPPRESSIONS: usize = 65_536;
+/// Maximum hierarchical active-call permits grouped into one call lease.
+pub const MAX_ADMISSION_LEASES_PER_CALL: usize = 16;
 
 struct Shared {
     active: AtomicUsize,
@@ -65,6 +67,65 @@ impl fmt::Debug for AdmissionLease {
         formatter
             .debug_struct("AdmissionLease")
             .field("released", &self.released)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Move-only group of global, project, trunk or destination call permits.
+///
+/// If acquisition of a later scope fails, dropping the partially built group
+/// releases every earlier permit automatically.
+#[derive(Default)]
+pub struct AdmissionLeaseGroup {
+    leases: Vec<AdmissionLease>,
+}
+
+impl AdmissionLeaseGroup {
+    /// Creates an empty call admission group.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { leases: Vec::new() }
+    }
+
+    /// Adds one acquired scope permit.
+    ///
+    /// # Errors
+    ///
+    /// Rejects excessive grouped scopes or allocation failure.
+    pub fn push(&mut self, lease: AdmissionLease) -> Result<(), AdmissionError> {
+        if self.leases.len() >= MAX_ADMISSION_LEASES_PER_CALL {
+            return Err(AdmissionError::TooManyGroupedLeases);
+        }
+        self.leases
+            .try_reserve(1)
+            .map_err(|_| AdmissionError::AllocationFailed)?;
+        self.leases.push(lease);
+        Ok(())
+    }
+
+    /// Returns grouped permit count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.leases.len()
+    }
+
+    /// Returns whether no permit is owned.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.leases.is_empty()
+    }
+
+    /// Releases every scope immediately. Drop is safe afterward.
+    pub fn release_all(&mut self) {
+        self.leases.clear();
+    }
+}
+
+impl fmt::Debug for AdmissionLeaseGroup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdmissionLeaseGroup")
+            .field("permit_count", &self.leases.len())
             .finish_non_exhaustive()
     }
 }
@@ -228,6 +289,8 @@ pub enum AdmissionError {
     SuppressionCapacityExceeded,
     /// Retry deadline overflowed.
     TimeOverflow,
+    /// One call attempted to aggregate too many admission scopes.
+    TooManyGroupedLeases,
 }
 impl fmt::Display for AdmissionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -238,7 +301,7 @@ impl StdError for AdmissionError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{AdmissionController, RetrySuppressor};
+    use super::{AdmissionController, AdmissionLeaseGroup, RetrySuppressor};
     use crate::sip::headers::retry_after::RetryAfter;
     use std::time::Duration;
 
@@ -267,5 +330,46 @@ mod tests {
         );
         assert!(!suppressor.may_attempt(7, Duration::from_secs(4)));
         assert!(suppressor.may_attempt(7, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn grouped_admission_releases_every_scope_on_drop_and_explicit_release() {
+        let global = AdmissionController::new(1, RetryAfter::new(3))
+            .unwrap_or_else(|_| panic!("global controller"));
+        let trunk = AdmissionController::new(1, RetryAfter::new(3))
+            .unwrap_or_else(|_| panic!("trunk controller"));
+        let mut group = AdmissionLeaseGroup::new();
+        assert!(
+            group
+                .push(
+                    global
+                        .try_admit()
+                        .unwrap_or_else(|_| panic!("global lease"))
+                )
+                .is_ok()
+        );
+        assert!(
+            group
+                .push(trunk.try_admit().unwrap_or_else(|_| panic!("trunk lease")))
+                .is_ok()
+        );
+        assert_eq!(global.active(), 1);
+        assert_eq!(trunk.active(), 1);
+        group.release_all();
+        assert_eq!(global.active(), 0);
+        assert_eq!(trunk.active(), 0);
+
+        let mut dropped = AdmissionLeaseGroup::new();
+        assert!(
+            dropped
+                .push(
+                    global
+                        .try_admit()
+                        .unwrap_or_else(|_| panic!("global lease"))
+                )
+                .is_ok()
+        );
+        drop(dropped);
+        assert_eq!(global.active(), 0);
     }
 }

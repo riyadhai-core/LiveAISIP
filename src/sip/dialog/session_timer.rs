@@ -50,6 +50,10 @@ pub struct SessionTimer {
     refresher: Refresher,
     refresh_at: Duration,
     expires_at: Duration,
+    active: bool,
+    refreshing: bool,
+    refresh_count: u32,
+    failed_refreshes: u32,
 }
 impl SessionTimer {
     /// Creates negotiated timer.
@@ -83,6 +87,10 @@ impl SessionTimer {
             refresher,
             refresh_at,
             expires_at,
+            active: true,
+            refreshing: false,
+            refresh_count: 0,
+            failed_refreshes: 0,
         })
     }
     /// Applies 422 Min-SE and returns retry interval seconds.
@@ -101,9 +109,11 @@ impl SessionTimer {
     /// Evaluates refresh/expiry independently of transport liveness.
     #[must_use]
     pub fn action(&self, now: Duration) -> SessionTimerAction {
-        if now >= self.expires_at {
+        if !self.active {
+            SessionTimerAction::None
+        } else if now >= self.expires_at {
             SessionTimerAction::Expired
-        } else if self.refresher == Refresher::Local && now >= self.refresh_at {
+        } else if self.refresher == Refresher::Local && !self.refreshing && now >= self.refresh_at {
             SessionTimerAction::Refresh
         } else {
             SessionTimerAction::None
@@ -121,7 +131,62 @@ impl SessionTimer {
         self.refresh_at = now
             .checked_add(self.interval / 2)
             .ok_or(SessionTimerError::TimeOverflow)?;
+        self.refresh_count = self
+            .refresh_count
+            .checked_add(1)
+            .ok_or(SessionTimerError::CounterExhausted)?;
+        self.refreshing = false;
         Ok(())
+    }
+
+    /// Marks a local refresh request in flight exactly once.
+    pub fn start_refresh(&mut self) -> bool {
+        if !self.active || self.refresher != Refresher::Local || self.refreshing {
+            return false;
+        }
+        self.refreshing = true;
+        true
+    }
+
+    /// Records a failed refresh attempt without extending session expiry.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a failure with no refresh in flight or counter exhaustion.
+    pub fn fail_refresh(&mut self) -> Result<(), SessionTimerError> {
+        if !self.refreshing {
+            return Err(SessionTimerError::RefreshNotActive);
+        }
+        self.refreshing = false;
+        self.failed_refreshes = self
+            .failed_refreshes
+            .checked_add(1)
+            .ok_or(SessionTimerError::CounterExhausted)?;
+        Ok(())
+    }
+
+    /// Permanently deactivates this negotiated timer.
+    pub const fn deactivate(&mut self) {
+        self.active = false;
+        self.refreshing = false;
+    }
+
+    /// Returns whether a local refresh request is in flight.
+    #[must_use]
+    pub const fn is_refreshing(&self) -> bool {
+        self.refreshing
+    }
+
+    /// Returns successful local or remote refresh count.
+    #[must_use]
+    pub const fn refresh_count(&self) -> u32 {
+        self.refresh_count
+    }
+
+    /// Returns failed local refresh attempts.
+    #[must_use]
+    pub const fn failed_refreshes(&self) -> u32 {
+        self.failed_refreshes
     }
     /// Returns negotiated minimum.
     #[must_use]
@@ -141,6 +206,10 @@ pub enum SessionTimerError {
     TimeOverflow,
     /// Interval could not fit wire seconds.
     IntervalTooLarge,
+    /// A failure was recorded without an active refresh attempt.
+    RefreshNotActive,
+    /// Refresh diagnostic counter exhausted.
+    CounterExhausted,
 }
 impl fmt::Display for SessionTimerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -172,5 +241,23 @@ mod tests {
             SessionTimerAction::Expired
         );
         assert_eq!(remote.retry_after_422(180), Ok(180));
+    }
+
+    #[test]
+    fn refresh_in_flight_and_failure_state_are_explicit() {
+        let mut timer = SessionTimer::new(100, 90, Refresher::Local, Duration::ZERO)
+            .unwrap_or_else(|_| panic!("timer"));
+        assert!(timer.start_refresh());
+        assert!(!timer.start_refresh());
+        assert_eq!(
+            timer.action(Duration::from_secs(50)),
+            SessionTimerAction::None
+        );
+        assert!(timer.fail_refresh().is_ok());
+        assert_eq!(timer.failed_refreshes(), 1);
+        assert!(timer.start_refresh());
+        assert!(timer.refreshed(Duration::from_secs(50)).is_ok());
+        assert_eq!(timer.refresh_count(), 1);
+        assert!(!timer.is_refreshing());
     }
 }

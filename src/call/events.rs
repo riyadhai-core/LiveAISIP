@@ -165,6 +165,22 @@ pub enum CallEvent {
     MediaTimedOut,
     /// Signaling transport failed.
     TransportFailed,
+    /// In-dialog offer/answer request preserving the signaling method.
+    SessionModification {
+        /// INVITE and UPDATE have distinct transaction/race semantics.
+        method: SessionModificationMethod,
+        /// Whether this request carries an SDP offer.
+        has_offer: bool,
+    },
+}
+
+/// SIP method initiating an in-dialog session modification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionModificationMethod {
+    /// Re-INVITE transaction.
+    Invite,
+    /// UPDATE transaction.
+    Update,
 }
 
 /// Explicit side effect produced by deterministic call state.
@@ -203,6 +219,13 @@ pub enum CallAction {
     SendReferReplaces {
         /// Local call supplying replacement dialog.
         other_call: CallReference,
+    },
+    /// Deliver explicit re-INVITE/UPDATE negotiation to dialog/media owner.
+    ApplySessionModification {
+        /// Original SIP method.
+        method: SessionModificationMethod,
+        /// Whether the request contains an SDP offer.
+        has_offer: bool,
     },
     /// Publish stable terminal outcome.
     Ended(CallEndReason),

@@ -21,6 +21,8 @@
 
 /// Bounded call/media admission and retry suppression.
 pub mod admission;
+/// Shared generation-fenced monotonic deadlines.
+pub mod deadline;
 /// Runtime media ownership and reconfiguration.
 pub mod media;
 /// Coordinated graceful shutdown.
