@@ -19,4 +19,6 @@
 
 //! RTP, RTCP, transport, statistics, and telephone-event support.
 
+pub mod clock;
 pub mod packet;
+pub mod stats;
