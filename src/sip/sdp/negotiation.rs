@@ -195,38 +195,7 @@ impl RtpMediaOffer {
         if maximum_packet_time_ms.is_some_and(|maximum| packet_time_ms > maximum) {
             return Err(NegotiationError::PacketTimeExceedsMaximum);
         }
-        let telephone_event = codecs
-            .iter()
-            .find(|codec| codec.name().is("telephone-event"))
-            .map(|codec| {
-                let mut allowed_events = standard_telephone_events();
-                let mut found = false;
-                for line in section.lines() {
-                    if line.field() != SdpField::Attribute {
-                        continue;
-                    }
-                    let Some(value) = line.value().strip_prefix("fmtp:") else {
-                        continue;
-                    };
-                    let Some((payload, parameters)) = value.split_once([' ', '\t']) else {
-                        continue;
-                    };
-                    if payload.parse::<u8>().ok() != Some(codec.payload_type().get()) {
-                        continue;
-                    }
-                    if found {
-                        return Err(NegotiationError::DuplicateTelephoneEventFormat);
-                    }
-                    allowed_events = parse_telephone_events(parameters.trim())?;
-                    found = true;
-                }
-                Ok(NegotiatedTelephoneEvent {
-                    payload_type: codec.payload_type(),
-                    clock_rate: codec.clock_rate(),
-                    allowed_events,
-                })
-            })
-            .transpose()?;
+        let telephone_event = find_telephone_event(section, &codecs)?;
 
         Ok(Self {
             media_type: media.media().clone(),
@@ -431,6 +400,44 @@ const fn standard_telephone_events() -> [u64; 4] {
     [0xffff, 0, 0, 0]
 }
 
+fn find_telephone_event(
+    section: &MediaSection,
+    codecs: &[Codec],
+) -> Result<Option<NegotiatedTelephoneEvent>, NegotiationError> {
+    let Some(codec) = codecs
+        .iter()
+        .find(|codec| codec.name().is("telephone-event"))
+    else {
+        return Ok(None);
+    };
+    let mut allowed_events = standard_telephone_events();
+    let mut found = false;
+    for line in section.lines() {
+        if line.field() != SdpField::Attribute {
+            continue;
+        }
+        let Some(value) = line.value().strip_prefix("fmtp:") else {
+            continue;
+        };
+        let Some((payload, parameters)) = value.split_once([' ', '\t']) else {
+            continue;
+        };
+        if payload.parse::<u8>().ok() != Some(codec.payload_type().get()) {
+            continue;
+        }
+        if found {
+            return Err(NegotiationError::DuplicateTelephoneEventFormat);
+        }
+        allowed_events = parse_telephone_events(parameters.trim())?;
+        found = true;
+    }
+    Ok(Some(NegotiatedTelephoneEvent {
+        payload_type: codec.payload_type(),
+        clock_rate: codec.clock_rate(),
+        allowed_events,
+    }))
+}
+
 fn parse_telephone_events(input: &str) -> Result<[u64; 4], NegotiationError> {
     if input.is_empty() {
         return Err(NegotiationError::InvalidTelephoneEventFormat);
@@ -440,20 +447,19 @@ fn parse_telephone_events(input: &str) -> Result<[u64; 4], NegotiationError> {
         if item.is_empty() {
             return Err(NegotiationError::InvalidTelephoneEventFormat);
         }
-        let (first, last) = match item.split_once('-') {
-            Some((first, last)) => (
+        let (first, last) = if let Some((first, last)) = item.split_once('-') {
+            (
                 first
                     .parse::<u8>()
                     .map_err(|_| NegotiationError::InvalidTelephoneEventFormat)?,
                 last.parse::<u8>()
                     .map_err(|_| NegotiationError::InvalidTelephoneEventFormat)?,
-            ),
-            None => {
-                let value = item
-                    .parse::<u8>()
-                    .map_err(|_| NegotiationError::InvalidTelephoneEventFormat)?;
-                (value, value)
-            }
+            )
+        } else {
+            let value = item
+                .parse::<u8>()
+                .map_err(|_| NegotiationError::InvalidTelephoneEventFormat)?;
+            (value, value)
         };
         if first > last {
             return Err(NegotiationError::InvalidTelephoneEventFormat);

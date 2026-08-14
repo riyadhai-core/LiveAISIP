@@ -51,3 +51,6 @@ pub mod flow;
 
 /// Wire-commit-aware bounded destination failover.
 pub mod failover;
+
+/// Bounded monotonic outbound-dial failure suppression.
+pub mod backoff;

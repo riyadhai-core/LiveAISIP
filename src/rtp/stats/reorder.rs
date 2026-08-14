@@ -121,8 +121,7 @@ impl DelayedLossTracker {
         for slot in &mut self.pending {
             if slot.is_some_and(|missing| {
                 highest.saturating_sub(missing) >= REORDER_WINDOW_PACKETS_U64
-            })
-            {
+            }) {
                 *slot = None;
                 self.finalized_lost = self.finalized_lost.saturating_add(1);
             }

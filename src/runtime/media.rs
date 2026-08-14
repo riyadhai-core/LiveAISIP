@@ -541,16 +541,20 @@ mod tests {
     fn unchanged_effective_sdp_does_not_rebuild_media_generation() {
         let mut controller = MediaController::new(false);
         let endpoint = SocketAddr::from(([192, 0, 2, 1], 4000));
-        let first = controller
+        let Ok(first) = controller
             .begin_local_offer()
             .and_then(|token| controller.apply_remote_answer(token, media(false), endpoint))
             .map(super::ActiveMedia::generation)
-            .unwrap_or_else(|_| panic!("first"));
-        let second = controller
+        else {
+            panic!("first")
+        };
+        let Ok(second) = controller
             .begin_local_offer()
             .and_then(|token| controller.apply_remote_answer(token, media(false), endpoint))
             .map(super::ActiveMedia::generation)
-            .unwrap_or_else(|_| panic!("second"));
+        else {
+            panic!("second")
+        };
         assert_eq!(first, second);
     }
 
@@ -559,17 +563,21 @@ mod tests {
         let mut controller = MediaController::new(false);
         let early_endpoint = SocketAddr::from(([192, 0, 2, 1], 4000));
         let final_endpoint = SocketAddr::from(([192, 0, 2, 2], 5000));
-        let early = controller
+        let Ok(early) = controller
             .begin_local_offer()
             .and_then(|token| controller.apply_remote_answer(token, media(false), early_endpoint))
             .map(super::ActiveMedia::generation)
-            .unwrap_or_else(|_| panic!("early media"));
+        else {
+            panic!("early media")
+        };
         let early_token = controller.work_token().unwrap_or_else(|| panic!("token"));
-        let final_generation = controller
+        let Ok(final_generation) = controller
             .begin_local_offer()
             .and_then(|token| controller.apply_remote_answer(token, media(false), final_endpoint))
             .map(super::ActiveMedia::generation)
-            .unwrap_or_else(|_| panic!("final media"));
+        else {
+            panic!("final media")
+        };
 
         assert!(final_generation > early);
         assert!(!controller.accepts(early_token));

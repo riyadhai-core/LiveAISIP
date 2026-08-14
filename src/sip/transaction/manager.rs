@@ -428,10 +428,10 @@ impl TransactionManager {
             .remove(&token.key)
             .ok_or(ManagerError::Unknown)?;
         if entry.transaction.kind() == super::state::TransactionKind::Invite
-            && matches!(
+            && (matches!(
                 entry.transaction.state(),
                 super::state::ClientState::Completed | super::state::ClientState::Accepted
-            )
+            ) || entry.transaction.retained_failure_ack().is_some())
         {
             let expires_at = now
                 .checked_add(entry.transaction.completion_retention())

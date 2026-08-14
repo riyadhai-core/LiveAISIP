@@ -29,7 +29,14 @@ mutate transaction, dialog, call, or media state directly.
 | Bounded early/confirmed forks | Implemented | `src/call/leg.rs` |
 | CANCEL/487 and CANCEL/200 races | Implemented | `src/call/lifecycle.rs` |
 | ACK every forked 2xx and BYE unwanted dialogs | Implemented | `src/call/lifecycle.rs` |
+| Late 2xx after non-2xx and compact completion retention | Implemented | `src/sip/transaction/client.rs`, `src/sip/transaction/completion.rs` |
+| Wire-commit-aware DNS candidate failover | Implemented | `src/sip/transport/failover.rs` |
+| Transport-truth ingress metadata and reliable flow routing | Implemented | `src/sip/transport/flow.rs` |
+| Bounded outbound dial-failure backoff | Implemented | `src/sip/transport/backoff.rs` |
+| Shared generation-fenced monotonic deadlines | Implemented | `src/runtime/deadline.rs` |
 | Atomic target refresh plus media replacement | Implemented | `src/runtime/media.rs` |
+| Effective-SDP media generation and stale-work fencing | Implemented | `src/runtime/media.rs` |
+| Ordered active/draining/closed media shutdown policy | Implemented | `src/runtime/media.rs` |
 | Serialized offer/answer and 491 glare result | Implemented | `src/sip/sdp/offer_answer.rs` |
 | Network `ptime` independent of AI frames | Implemented | `src/sip/sdp/negotiation.rs`, `src/media/audio.rs` |
 | Secure symmetric RTP probation/rebinding | Implemented | `src/rtp/transport/symmetric.rs` |
@@ -45,11 +52,17 @@ mutate transaction, dialog, call, or media state directly.
 | 503, Retry-After, admission, retry suppression | Implemented | `src/runtime/admission.rs` |
 | Stateful isolated 401/407 Digest contexts | Implemented | `src/sip/auth/context.rs` |
 | PRACK/RSeq correlation | Implemented | `src/sip/dialog/reliable.rs` |
+| Reliable provisional retransmission and final-response fence | Implemented | `src/sip/dialog/reliable.rs` |
 | RFC 4028 refresh, expiry, and 422 retry | Implemented | `src/sip/dialog/session_timer.rs` |
 | Stable SDK call-end reasons | Implemented | `src/call/state.rs` |
 | Explicit bounded redirect policy | Implemented | `src/call/redirect.rs` |
 | Blind/attended REFER-Replaces and NOTIFY state | Implemented | `src/call/transfer.rs` |
 | No implicit SRTP-to-RTP downgrade | Implemented | `src/rtp/security.rs`, `src/runtime/media.rs` |
+| Generation-fenced SRTP rekey rollback authority | Implemented | `src/rtp/security.rs` |
+| SDP-negotiated telephone-event routing outside NetEq | Implemented | `src/sip/sdp/negotiation.rs`, `src/rtp/session.rs` |
+| Constant-memory delayed-loss observability | Implemented | `src/rtp/stats/reorder.rs` |
+| Permanent per-call packet scratch buffers | Implemented | `src/rtp/transport/socket.rs` |
+| Grouped RAII admission permits | Implemented | `src/runtime/admission.rs` |
 | Privacy-safe bounded call timeline | Implemented | `src/observability/diagnostics.rs` |
 | Graceful admission fence/drain/force shutdown | Implemented | `src/runtime/shutdown.rs` |
 
