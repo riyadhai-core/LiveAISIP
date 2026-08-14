@@ -41,6 +41,28 @@ pub struct RtpMediaOffer {
     port: u16,
     codecs: Vec<Codec>,
     direction: Direction,
+    packetization: Packetization,
+}
+
+/// Negotiated network packetization, independent of 10 ms AI frames.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Packetization {
+    packet_time_ms: u16,
+    maximum_packet_time_ms: Option<u16>,
+}
+
+impl Packetization {
+    /// Returns selected network packet duration.
+    #[must_use]
+    pub const fn packet_time_ms(self) -> u16 {
+        self.packet_time_ms
+    }
+
+    /// Returns remote maximum packet duration when advertised.
+    #[must_use]
+    pub const fn maximum_packet_time_ms(self) -> Option<u16> {
+        self.maximum_packet_time_ms
+    }
 }
 
 impl RtpMediaOffer {
@@ -76,6 +98,8 @@ impl RtpMediaOffer {
 
         let mut mappings = Vec::new();
         let mut media_direction = None;
+        let mut packet_time_ms = None;
+        let mut maximum_packet_time_ms = None;
         for line in section.lines() {
             if line.field() != SdpField::Attribute {
                 continue;
@@ -83,6 +107,21 @@ impl RtpMediaOffer {
             if let Ok(direction) = Direction::from_bytes(line.value().as_bytes()) {
                 if media_direction.replace(direction).is_some() {
                     return Err(NegotiationError::DuplicateDirection);
+                }
+                continue;
+            }
+            if let Some(value) = line.value().strip_prefix("ptime:") {
+                if packet_time_ms.replace(parse_packet_time(value)?).is_some() {
+                    return Err(NegotiationError::DuplicatePacketTime);
+                }
+                continue;
+            }
+            if let Some(value) = line.value().strip_prefix("maxptime:") {
+                if maximum_packet_time_ms
+                    .replace(parse_packet_time(value)?)
+                    .is_some()
+                {
+                    return Err(NegotiationError::DuplicateMaximumPacketTime);
                 }
                 continue;
             }
@@ -121,12 +160,20 @@ impl RtpMediaOffer {
             }
         }
 
+        let packet_time_ms = packet_time_ms.unwrap_or(20);
+        if maximum_packet_time_ms.is_some_and(|maximum| packet_time_ms > maximum) {
+            return Err(NegotiationError::PacketTimeExceedsMaximum);
+        }
         Ok(Self {
             media_type: media.media().clone(),
             protocol: media.protocol().clone(),
             port: media.port(),
             codecs,
             direction: media_direction.unwrap_or(inherited_direction),
+            packetization: Packetization {
+                packet_time_ms,
+                maximum_packet_time_ms,
+            },
         })
     }
 
@@ -158,6 +205,12 @@ impl RtpMediaOffer {
     #[must_use]
     pub const fn direction(&self) -> Direction {
         self.direction
+    }
+
+    /// Returns network packetization attributes.
+    #[must_use]
+    pub const fn packetization(&self) -> Packetization {
+        self.packetization
     }
 
     /// Selects a codec using local preference order.
@@ -196,6 +249,7 @@ impl RtpMediaOffer {
                     direction: self.direction.answer(local_can_send, local_can_receive),
                     protocol: self.protocol.clone(),
                     remote_port: self.port,
+                    packetization: self.packetization,
                 });
             }
         }
@@ -210,6 +264,7 @@ pub struct NegotiatedMedia {
     direction: Direction,
     protocol: TransportProtocol,
     remote_port: u16,
+    packetization: Packetization,
 }
 
 impl NegotiatedMedia {
@@ -236,6 +291,12 @@ impl NegotiatedMedia {
     pub const fn remote_port(&self) -> u16 {
         self.remote_port
     }
+
+    /// Returns negotiated network packetization.
+    #[must_use]
+    pub const fn packetization(&self) -> Packetization {
+        self.packetization
+    }
 }
 
 /// RTP media negotiation failure.
@@ -258,6 +319,14 @@ pub enum NegotiationError {
     MissingPayloadMapping(PayloadType),
     /// More than one media-level direction attribute appeared.
     DuplicateDirection,
+    /// Multiple `ptime` attributes appeared.
+    DuplicatePacketTime,
+    /// Multiple `maxptime` attributes appeared.
+    DuplicateMaximumPacketTime,
+    /// Packet-time attribute was malformed or outside 1..=1000 ms.
+    InvalidPacketTime,
+    /// `ptime` exceeded advertised `maxptime`.
+    PacketTimeExceedsMaximum,
     /// Media was rejected with port zero.
     RejectedMedia,
     /// Policy required a secure RTP profile.
@@ -290,6 +359,19 @@ impl From<DirectionParseError> for NegotiationError {
     fn from(_: DirectionParseError) -> Self {
         Self::DuplicateDirection
     }
+}
+
+fn parse_packet_time(value: &str) -> Result<u16, NegotiationError> {
+    if value.is_empty() || value.len() > 4 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(NegotiationError::InvalidPacketTime);
+    }
+    let parsed = value
+        .parse::<u16>()
+        .map_err(|_| NegotiationError::InvalidPacketTime)?;
+    if parsed == 0 || parsed > 1_000 {
+        return Err(NegotiationError::InvalidPacketTime);
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]

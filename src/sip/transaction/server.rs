@@ -67,6 +67,16 @@ pub enum Action {
     Terminate,
 }
 
+/// State-explicit handling for a retransmitted request.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum DuplicateRequestDisposition {
+    /// Replay the most recent provisional or non-2xx final response.
+    ReplayResponse(Arc<[u8]>),
+    /// Consume the retransmission without transport or TU work.
+    Absorb,
+}
+
 /// Deterministic server transaction.
 pub struct ServerTransaction {
     key: TransactionKey,
@@ -174,12 +184,23 @@ impl ServerTransaction {
         Ok(actions)
     }
 
-    /// Replays the last response for a duplicate request.
+    /// Classifies a duplicate request without redelivering it to the TU.
+    ///
+    /// RFC 6026 Accepted INVITE transactions absorb retransmitted INVITEs;
+    /// the transaction itself must not replay the stored 2xx. Proceeding and
+    /// Completed transactions replay their latest response when available.
     #[must_use]
-    pub fn on_duplicate_request(&self) -> Option<Action> {
-        self.last_response
-            .as_ref()
-            .map(|bytes| Action::SendResponse(Arc::clone(bytes)))
+    pub fn on_duplicate_request(&self) -> DuplicateRequestDisposition {
+        if matches!(
+            self.machine.state(),
+            ServerState::Accepted | ServerState::Confirmed | ServerState::Terminated
+        ) {
+            return DuplicateRequestDisposition::Absorb;
+        }
+        match &self.last_response {
+            Some(bytes) => DuplicateRequestDisposition::ReplayResponse(Arc::clone(bytes)),
+            None => DuplicateRequestDisposition::Absorb,
+        }
     }
 
     /// Applies ACK to a non-2xx INVITE final response.
@@ -222,7 +243,7 @@ impl ServerTransaction {
                 let current = self.next_retransmit.ok_or(ServerError::InvalidTimer)?;
                 let next = self
                     .profile
-                    .next_retransmit(current)
+                    .next_invite_server_retransmit(current)
                     .ok_or(ServerError::InvalidTimer)?;
                 self.next_retransmit = Some(next);
                 Ok(vec![
@@ -335,5 +356,72 @@ impl StdError for ServerError {
             Self::State(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{DuplicateRequestDisposition, ServerTransaction};
+    use crate::sip::parser::message::parse;
+    use crate::sip::transaction::timer::TimerConfig;
+    use crate::sip::types::status::StatusCode;
+    use crate::sip::validation;
+
+    fn invite() -> validation::request::ValidatedRequest {
+        let bytes = b"INVITE sip:x@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP host;branch=z9hG4bK-one\r\n\
+From: <sip:a@example.com>;tag=a\r\nTo: <sip:x@example.com>\r\n\
+Call-ID: one@example.com\r\nCSeq: 1 INVITE\r\n\
+Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n";
+        let Ok(raw) = parse(Arc::from(&bytes[..])) else {
+            panic!("parse")
+        };
+        let Ok(request) = validation::request::validate(raw) else {
+            panic!("validate")
+        };
+        request
+    }
+
+    fn transaction() -> ServerTransaction {
+        let request = invite();
+        let Ok(mut transaction) = ServerTransaction::new(&request, false, TimerConfig::default())
+        else {
+            panic!("transaction")
+        };
+        assert!(transaction.start().is_ok());
+        transaction
+    }
+
+    #[test]
+    fn accepted_invite_absorbs_duplicate_without_replaying_2xx() {
+        let mut transaction = transaction();
+        assert!(
+            transaction
+                .send_response(StatusCode::OK, Arc::from(&b"private-200"[..]))
+                .is_ok()
+        );
+        assert!(matches!(
+            transaction.on_duplicate_request(),
+            DuplicateRequestDisposition::Absorb
+        ));
+    }
+
+    #[test]
+    fn completed_invite_replays_non_2xx_for_duplicate() {
+        let mut transaction = transaction();
+        let response: Arc<[u8]> = Arc::from(&b"private-486"[..]);
+        assert!(
+            transaction
+                .send_response(StatusCode::BUSY_HERE, Arc::clone(&response))
+                .is_ok()
+        );
+        let DuplicateRequestDisposition::ReplayResponse(replayed) =
+            transaction.on_duplicate_request()
+        else {
+            panic!("completed INVITE must replay final response")
+        };
+        assert!(Arc::ptr_eq(&response, &replayed));
     }
 }

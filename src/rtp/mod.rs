@@ -20,6 +20,14 @@
 //! RTP, RTCP, transport, statistics, and telephone-event support.
 
 pub mod clock;
+pub mod dtmf;
+pub mod liveness;
 pub mod packet;
+pub mod queue;
+pub mod rtcp_scheduler;
+pub mod security;
+pub mod session;
+pub mod source;
 pub mod state;
 pub mod stats;
+pub mod transport;

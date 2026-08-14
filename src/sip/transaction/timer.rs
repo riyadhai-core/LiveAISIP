@@ -184,9 +184,39 @@ impl TimerProfile {
         self.server_non_invite_lifetime
     }
 
-    /// Computes the next exponential retransmission interval capped at T2.
+    /// Computes the next Timer A interval for an INVITE client transaction.
+    ///
+    /// Timer A doubles without a T2 cap. Timer B independently bounds the
+    /// complete INVITE transaction lifetime.
     #[must_use]
-    pub fn next_retransmit(self, current: Duration) -> Option<Duration> {
+    pub fn next_invite_client_retransmit(self, current: Duration) -> Option<Duration> {
+        self.retransmit_initial?;
+        current.checked_mul(2)
+    }
+
+    /// Computes the next Timer E interval for a non-INVITE client transaction.
+    ///
+    /// Before a provisional response, Timer E doubles up to T2. In Proceeding
+    /// it uses T2 for every subsequent retransmission.
+    #[must_use]
+    pub fn next_non_invite_client_retransmit(
+        self,
+        current: Duration,
+        proceeding: bool,
+    ) -> Option<Duration> {
+        let maximum = self.retransmit_maximum?;
+        if proceeding {
+            Some(maximum)
+        } else {
+            Some(current.checked_mul(2).unwrap_or(maximum).min(maximum))
+        }
+    }
+
+    /// Computes the next Timer G interval for an INVITE server transaction.
+    ///
+    /// Timer G doubles up to T2 while the final non-2xx response awaits ACK.
+    #[must_use]
+    pub fn next_invite_server_retransmit(self, current: Duration) -> Option<Duration> {
         let maximum = self.retransmit_maximum?;
         Some(current.checked_mul(2).unwrap_or(maximum).min(maximum))
     }
@@ -268,17 +298,50 @@ mod tests {
     }
 
     #[test]
-    fn retransmission_backoff_caps_at_t2() {
+    fn timer_a_doubles_without_t2_cap() {
         let profile = TimerConfig::default().profile(false);
         assert_eq!(
-            profile.next_retransmit(DEFAULT_T1),
+            profile.next_invite_client_retransmit(DEFAULT_T1),
             Some(Duration::from_secs(1))
         );
         assert_eq!(
-            profile.next_retransmit(Duration::from_secs(3)),
+            profile.next_invite_client_retransmit(DEFAULT_T2),
+            Some(Duration::from_secs(8))
+        );
+    }
+
+    #[test]
+    fn timer_e_caps_at_t2_and_uses_t2_in_proceeding() {
+        let profile = TimerConfig::default().profile(false);
+        assert_eq!(
+            profile.next_non_invite_client_retransmit(DEFAULT_T1, false),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            profile.next_non_invite_client_retransmit(Duration::from_secs(3), false),
             Some(DEFAULT_T2)
         );
-        assert_eq!(profile.next_retransmit(DEFAULT_T2), Some(DEFAULT_T2));
+        assert_eq!(
+            profile.next_non_invite_client_retransmit(Duration::from_secs(1), true),
+            Some(DEFAULT_T2)
+        );
+    }
+
+    #[test]
+    fn timer_g_caps_at_t2() {
+        let profile = TimerConfig::default().profile(false);
+        assert_eq!(
+            profile.next_invite_server_retransmit(DEFAULT_T1),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            profile.next_invite_server_retransmit(Duration::from_secs(3)),
+            Some(DEFAULT_T2)
+        );
+        assert_eq!(
+            profile.next_invite_server_retransmit(DEFAULT_T2),
+            Some(DEFAULT_T2)
+        );
     }
 
     #[test]
