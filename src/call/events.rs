@@ -5,6 +5,8 @@
 // You may obtain a copy of the License at
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
@@ -14,6 +16,96 @@
 
 use super::leg::DialogBranchId;
 use super::state::CallEndReason;
+use crate::sip::parser::uri::{ParseError as UriParseError, parse_str};
+use crate::sip::types::uri::Uri;
+use std::error::Error as StdError;
+use std::fmt;
+
+/// Generation-fenced reference to another local call actor.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CallReference {
+    call_id: u64,
+    generation: u64,
+}
+
+impl CallReference {
+    pub(crate) const fn new(call_id: u64, generation: u64) -> Self {
+        Self {
+            call_id,
+            generation,
+        }
+    }
+
+    /// Returns application call identifier.
+    #[must_use]
+    pub const fn call_id(self) -> u64 {
+        self.call_id
+    }
+
+    /// Returns nonreused actor generation.
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+/// Validated SIP or SIPS target for blind transfer.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TransferTarget(Uri);
+
+impl TransferTarget {
+    /// Parses and validates a transfer target.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed and non-SIP absolute URIs.
+    pub fn parse(value: &str) -> Result<Self, TransferTargetError> {
+        let uri = parse_str(value).map_err(TransferTargetError::Parse)?;
+        if !uri.is_sip() {
+            return Err(TransferTargetError::NotSipUri);
+        }
+        Ok(Self(uri))
+    }
+
+    /// Returns the validated target URI.
+    #[must_use]
+    pub const fn uri(&self) -> &Uri {
+        &self.0
+    }
+}
+
+impl fmt::Debug for TransferTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransferTarget")
+            .field("scheme", &self.0.scheme())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Transfer-target validation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferTargetError {
+    /// URI syntax was invalid.
+    Parse(UriParseError),
+    /// Target used a non-SIP absolute scheme.
+    NotSipUri,
+}
+
+impl fmt::Display for TransferTargetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("transfer target is invalid")
+    }
+}
+
+impl StdError for TransferTargetError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Parse(error) => Some(error),
+            Self::NotSipUri => None,
+        }
+    }
+}
 
 /// Commands accepted from the Runtime/Python control plane.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,12 +117,12 @@ pub enum CallCommand {
     /// Blind transfer to an already validated target handle.
     BlindTransfer {
         /// Validated transfer target.
-        target: Box<str>,
+        target: TransferTarget,
     },
     /// Attended transfer replacing this dialog with another local call.
     AttendedTransfer {
         /// Local call whose dialog supplies Replaces identity.
-        other_call: u64,
+        other_call: CallReference,
     },
 }
 
@@ -105,12 +197,12 @@ pub enum CallAction {
     /// Send REFER for blind transfer.
     SendRefer {
         /// Validated transfer target.
-        target: Box<str>,
+        target: TransferTarget,
     },
     /// Send REFER with Replaces for attended transfer.
     SendReferReplaces {
         /// Local call supplying replacement dialog.
-        other_call: u64,
+        other_call: CallReference,
     },
     /// Publish stable terminal outcome.
     Ended(CallEndReason),

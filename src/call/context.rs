@@ -5,6 +5,8 @@
 // You may obtain a copy of the License at
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
@@ -19,7 +21,7 @@ use std::time::Duration;
 use crate::observability::{CallTimeline, TimelineError, TimelineEvent};
 use crate::rtp::queue::{BoundedQueue, OverflowPolicy, PushOutcome, QueueDiagnostics, QueueError};
 
-use super::events::{CallAction, CallEvent};
+use super::events::{CallAction, CallCommand, CallEvent};
 use super::lifecycle::{CallLifecycle, LifecycleError};
 
 /// Default serialized event mailbox capacity per call.
@@ -78,15 +80,27 @@ impl CallContext {
         let Some(event) = self.inbox.pop() else {
             return Ok(None);
         };
+        self.timeline
+            .validate_time(now)
+            .map_err(CallContextError::Timeline)?;
         let event_class = timeline_event(&event);
         let detail = timeline_detail(&event);
         let actions = self
             .lifecycle
             .handle(event)
             .map_err(CallContextError::Lifecycle)?;
-        self.timeline
-            .record(now, event_class, detail)
-            .map_err(CallContextError::Timeline)?;
+        if let Some(event_class) = event_class {
+            self.timeline
+                .record(now, event_class, detail)
+                .map_err(CallContextError::Timeline)?;
+        }
+        for action in &actions {
+            if let Some(action_class) = timeline_action(action) {
+                self.timeline
+                    .record(now, action_class, None)
+                    .map_err(CallContextError::Timeline)?;
+            }
+        }
         Ok(Some(actions))
     }
 
@@ -120,17 +134,35 @@ impl fmt::Debug for CallContext {
     }
 }
 
-fn timeline_event(event: &CallEvent) -> TimelineEvent {
+fn timeline_event(event: &CallEvent) -> Option<TimelineEvent> {
     match event {
-        CallEvent::Command(_) => TimelineEvent::InviteSent,
-        CallEvent::Provisional { has_sdp: true, .. } => TimelineEvent::EarlyMediaApplied,
-        CallEvent::Provisional { .. } => TimelineEvent::ProvisionalReceived,
-        CallEvent::InviteAccepted { .. } => TimelineEvent::InviteAccepted,
-        CallEvent::InviteRejected { .. } => TimelineEvent::InviteRejected,
-        CallEvent::CancelAccepted => TimelineEvent::CancelSent,
-        CallEvent::ByeCompleted { .. } | CallEvent::RemoteBye => TimelineEvent::CallEnded,
-        CallEvent::SignalingTimedOut | CallEvent::MediaTimedOut => TimelineEvent::MediaTimedOut,
-        CallEvent::TransportFailed => TimelineEvent::TransportFailed,
+        CallEvent::Command(CallCommand::Start) | CallEvent::CancelAccepted => None,
+        CallEvent::Command(CallCommand::Hangup) => Some(TimelineEvent::HangupRequested),
+        CallEvent::Command(
+            CallCommand::BlindTransfer { .. } | CallCommand::AttendedTransfer { .. },
+        ) => Some(TimelineEvent::TransferRequested),
+        CallEvent::Provisional { .. } => Some(TimelineEvent::ProvisionalReceived),
+        CallEvent::InviteAccepted { .. } => Some(TimelineEvent::InviteAccepted),
+        CallEvent::InviteRejected { .. } => Some(TimelineEvent::InviteRejected),
+        CallEvent::ByeCompleted { .. } | CallEvent::RemoteBye => Some(TimelineEvent::CallEnded),
+        CallEvent::SignalingTimedOut => Some(TimelineEvent::SignalingTimedOut),
+        CallEvent::MediaTimedOut => Some(TimelineEvent::MediaTimedOut),
+        CallEvent::TransportFailed => Some(TimelineEvent::TransportFailed),
+    }
+}
+
+fn timeline_action(action: &CallAction) -> Option<TimelineEvent> {
+    match action {
+        CallAction::SendInvite => Some(TimelineEvent::InviteSent),
+        CallAction::SendCancel => Some(TimelineEvent::CancelSent),
+        CallAction::SendAck { .. } => Some(TimelineEvent::AckSent),
+        CallAction::SendBye { .. } => Some(TimelineEvent::ByeSent),
+        CallAction::ApplyEarlyMedia { .. } => Some(TimelineEvent::EarlyMediaApplied),
+        CallAction::SendRefer { .. } | CallAction::SendReferReplaces { .. } => {
+            Some(TimelineEvent::TransferSent)
+        }
+        CallAction::Ended(_) => Some(TimelineEvent::CallEnded),
+        CallAction::SelectBranch { .. } => None,
     }
 }
 

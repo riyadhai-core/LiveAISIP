@@ -32,12 +32,15 @@ use std::time::Duration;
 use super::key::{KeyError, TransactionKey};
 use super::state::{ServerMachine, ServerState, StateError, TransactionKind};
 use super::timer::{TimerConfig, TimerProfile};
+use crate::sip::builder::response::{BuildError as ResponseBuildError, ResponseBuilder};
 use crate::sip::types::status::StatusCode;
 use crate::sip::validation::request::ValidatedRequest;
 
 /// Server transaction timer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Timer {
+    /// Automatic 100 Trying deadline for an INVITE.
+    Trying,
     /// G response retransmission.
     Retransmit,
     /// H/L final-response lifetime.
@@ -84,6 +87,7 @@ pub struct ServerTransaction {
     profile: TimerProfile,
     reliable: bool,
     last_response: Option<Arc<[u8]>>,
+    automatic_trying: Option<Arc<[u8]>>,
     next_retransmit: Option<Duration>,
     started: bool,
 }
@@ -102,12 +106,31 @@ impl ServerTransaction {
         let key = TransactionKey::for_server_request(request)?;
         let kind = TransactionKind::from_method(request.request_line().method());
         let profile = timers.profile(reliable);
+        let automatic_trying = if kind == TransactionKind::Invite {
+            let headers = request.core_headers();
+            let bytes = ResponseBuilder::new(
+                StatusCode::TRYING,
+                b"Trying",
+                headers.via(),
+                headers.from_header(),
+                headers.to_header(),
+                headers.call_id(),
+                headers.cseq(),
+            )
+            .map_err(ServerError::TryingBuild)?
+            .serialize()
+            .map_err(ServerError::TryingBuild)?;
+            Some(Arc::from(bytes))
+        } else {
+            None
+        };
         Ok(Self {
             key,
             machine: ServerMachine::new(kind),
             profile,
             reliable,
             last_response: None,
+            automatic_trying,
             next_retransmit: profile.retransmit_initial(),
             started: false,
         })
@@ -123,7 +146,14 @@ impl ServerTransaction {
             return Err(ServerError::AlreadyStarted);
         }
         self.started = true;
-        Ok(vec![Action::DeliverRequest])
+        let mut actions = vec![Action::DeliverRequest];
+        if self.machine_kind() == TransactionKind::Invite {
+            actions.push(Action::Schedule {
+                timer: Timer::Trying,
+                after: Duration::from_millis(200),
+            });
+        }
+        Ok(actions)
     }
 
     /// Records and transmits a fully serialized response.
@@ -144,6 +174,9 @@ impl ServerTransaction {
         let state = self.machine.on_response(status)?;
         self.last_response = Some(Arc::clone(&bytes));
         let mut actions = vec![Action::SendResponse(bytes)];
+        if self.machine_kind() == TransactionKind::Invite {
+            actions.push(Action::Cancel(Timer::Trying));
+        }
 
         if state != previous && matches!(state, ServerState::Completed | ServerState::Accepted) {
             match (self.machine_kind(), state) {
@@ -235,6 +268,19 @@ impl ServerTransaction {
     pub fn on_timer(&mut self, timer: Timer) -> Result<Vec<Action>, ServerError> {
         self.require_started()?;
         match timer {
+            Timer::Trying
+                if self.machine_kind() == TransactionKind::Invite
+                    && self.machine.state() == ServerState::Proceeding
+                    && self.last_response.is_none() =>
+            {
+                let response = self
+                    .automatic_trying
+                    .take()
+                    .ok_or(ServerError::InvalidTimer)?;
+                self.machine.on_response(StatusCode::TRYING)?;
+                self.last_response = Some(Arc::clone(&response));
+                Ok(vec![Action::SendResponse(response)])
+            }
             Timer::Retransmit if self.machine.state() == ServerState::Completed => {
                 let response = self
                     .last_response
@@ -330,6 +376,8 @@ pub enum ServerError {
     NotStarted,
     /// Serialized response was empty.
     EmptyResponse,
+    /// Automatic `100 Trying` construction failed.
+    TryingBuild(ResponseBuildError),
     /// Timer was stale for current state.
     InvalidTimer,
 }
@@ -354,6 +402,7 @@ impl StdError for ServerError {
         match self {
             Self::Key(error) => Some(error),
             Self::State(error) => Some(error),
+            Self::TryingBuild(error) => Some(error),
             _ => None,
         }
     }
@@ -423,5 +472,38 @@ Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n";
             panic!("completed INVITE must replay final response")
         };
         assert!(Arc::ptr_eq(&response, &replayed));
+    }
+
+    #[test]
+    fn invite_schedules_automatic_trying_and_tu_response_cancels_it() {
+        let request = invite();
+        let Ok(mut transaction) = ServerTransaction::new(&request, false, TimerConfig::default())
+        else {
+            panic!("transaction")
+        };
+        let Ok(start) = transaction.start() else {
+            panic!("start")
+        };
+        assert!(start.iter().any(|action| matches!(
+            action,
+            super::Action::Schedule {
+                timer: super::Timer::Trying,
+                after
+            } if *after == std::time::Duration::from_millis(200)
+        )));
+        let Ok(actions) = transaction.on_timer(super::Timer::Trying) else {
+            panic!("trying timer")
+        };
+        let [super::Action::SendResponse(trying)] = actions.as_slice() else {
+            panic!("automatic response")
+        };
+        assert!(trying.starts_with(b"SIP/2.0 100 Trying\r\n"));
+        let DuplicateRequestDisposition::ReplayResponse(replayed) =
+            transaction.on_duplicate_request()
+        else {
+            panic!("replay Trying")
+        };
+        assert!(Arc::ptr_eq(trying, &replayed));
+        assert!(transaction.on_timer(super::Timer::Trying).is_err());
     }
 }

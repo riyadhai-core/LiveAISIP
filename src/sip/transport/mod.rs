@@ -36,3 +36,12 @@ pub mod tls;
 
 /// Bounded actor-owned reliable connection registry.
 pub mod manager;
+
+/// Encoded-size and security-aware destination selection.
+pub mod selection;
+
+/// Hostile-network stream limits and liveness.
+pub mod stream;
+
+/// Bounded RFC 3263 destination planning over validated DNS answers.
+pub mod resolver;

@@ -5,6 +5,8 @@
 // You may obtain a copy of the License at
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
@@ -23,8 +25,12 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use super::liveness::{MediaLiveness, MediaLivenessError};
+use super::packet::rtcp::{CompoundPolicy, CompoundRtcp, CompoundRtcpError, Goodbye, RtcpPacket};
 use super::packet::rtp::{RtpPacket, RtpPacketError};
 use super::queue::{BoundedQueue, OverflowPolicy, PushOutcome, QueueDiagnostics, QueueError};
+use super::rtcp_scheduler::{
+    RtcpScheduleConfig, RtcpScheduler, RtcpSchedulerError, ScheduledReport,
+};
 use super::security::{MediaSecurityError, MediaSecurityPolicy, PacketProtection};
 use super::source::{RemoteSourceTracker, SourceObservation, SourcePolicy};
 use super::state::{ReceivePacketOutcome, RtpReceiveConfig, RtpReceiveState, RtpStateError};
@@ -116,6 +122,24 @@ pub enum RtpIngressOutcome {
     QueueDropped,
 }
 
+/// Result of one RTCP datagram at the session boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RtcpIngressOutcome {
+    /// Datagram was not RTCP-family control traffic.
+    ClassifiedOut(DatagramClassification),
+    /// Primary RTCP source did not match the active RTP source.
+    SourceRejected,
+    /// Valid control packets updated session state.
+    Accepted {
+        /// Symmetric RTCP endpoint observation.
+        endpoint: SymmetricObservation,
+        /// Number of packets in the compound datagram.
+        packet_count: usize,
+        /// Whether a Sender Report refreshed LSR/DLSR timing.
+        sender_report: bool,
+    },
+}
+
 /// One owned receive session with no shared mutable state.
 pub struct RtpSession {
     receive_config: RtpReceiveConfig,
@@ -127,6 +151,8 @@ pub struct RtpSession {
     liveness: MediaLiveness,
     ingress: BoundedQueue<NetEqPacket>,
     source_resets: u64,
+    rtcp: Option<RtcpScheduler>,
+    rtcp_policy: CompoundPolicy,
 }
 
 impl RtpSession {
@@ -155,7 +181,29 @@ impl RtpSession {
             ingress: BoundedQueue::new(ingress_capacity, OverflowPolicy::DropNewest)
                 .map_err(RtpSessionError::Queue)?,
             source_resets: 0,
+            rtcp: None,
+            rtcp_policy: CompoundPolicy::Strict,
         })
+    }
+
+    /// Installs or atomically replaces session-owned RTCP scheduling state.
+    ///
+    /// # Errors
+    ///
+    /// Preserves RTCP scheduler validation and allocation failures.
+    pub fn configure_rtcp(
+        &mut self,
+        config: RtcpScheduleConfig,
+        local_ssrc: u32,
+        cname: &[u8],
+        policy: CompoundPolicy,
+        now: Duration,
+    ) -> Result<(), RtpSessionError> {
+        let scheduler =
+            RtcpScheduler::new(config, local_ssrc, cname, now).map_err(RtpSessionError::Rtcp)?;
+        self.rtcp = Some(scheduler);
+        self.rtcp_policy = policy;
+        Ok(())
     }
 
     /// Processes one already-decrypted/authenticated RTP-socket datagram.
@@ -216,6 +264,97 @@ impl RtpSession {
         }
     }
 
+    /// Processes one already-decrypted/authenticated RTCP-socket datagram.
+    ///
+    /// # Errors
+    ///
+    /// Preserves security, compound parsing, endpoint and clock failures.
+    pub fn ingest_rtcp(
+        &mut self,
+        network_source: SocketAddr,
+        datagram: &[u8],
+        arrival: Duration,
+        protection: PacketProtection,
+    ) -> Result<RtcpIngressOutcome, RtpSessionError> {
+        self.security
+            .admit(protection)
+            .map_err(RtpSessionError::Security)?;
+        let classification = self.classifier.classify(Component::Rtcp, datagram);
+        if classification != DatagramClassification::Rtcp {
+            return Ok(RtcpIngressOutcome::ClassifiedOut(classification));
+        }
+        let compound = CompoundRtcp::parse(datagram, self.rtcp_policy)
+            .map_err(RtpSessionError::CompoundRtcp)?;
+        let active_ssrc = self.source.active_ssrc();
+        let primary = compound.packets().iter().find_map(|packet| match packet {
+            RtcpPacket::SenderReport(report) => Some(report.sender_ssrc()),
+            RtcpPacket::ReceiverReport(report) => Some(report.receiver_ssrc()),
+            _ => None,
+        });
+        if active_ssrc.is_none() || primary != active_ssrc {
+            return Ok(RtcpIngressOutcome::SourceRejected);
+        }
+        let mut sender_report = false;
+        for packet in compound.packets() {
+            if let RtcpPacket::SenderReport(report) = packet {
+                self.receive
+                    .note_sender_report(report.sender_info().compact_ntp(), arrival);
+                sender_report = true;
+            }
+        }
+        let endpoint = self
+            .endpoints
+            .observe_validated_source(Component::Rtcp, network_source)
+            .map_err(RtpSessionError::Endpoint)?;
+        self.liveness
+            .note_rtcp_receive(arrival)
+            .map_err(RtpSessionError::Liveness)?;
+        Ok(RtcpIngressOutcome::Accepted {
+            endpoint,
+            packet_count: compound.packets().len(),
+            sender_report,
+        })
+    }
+
+    /// Accounts one successfully sent RTP payload for the next Sender Report.
+    pub fn note_rtp_sent(&mut self, payload_octets: usize) {
+        if let Some(rtcp) = &mut self.rtcp {
+            rtcp.note_rtp_sent(payload_octets);
+        }
+    }
+
+    /// Polls the session-owned RTCP report cadence.
+    ///
+    /// # Errors
+    ///
+    /// Rejects polling before RTCP configuration and preserves scheduler errors.
+    pub fn poll_rtcp(
+        &mut self,
+        now: Duration,
+        ntp_timestamp: u64,
+        rtp_timestamp: u32,
+    ) -> Result<Option<ScheduledReport>, RtpSessionError> {
+        let rtcp = self
+            .rtcp
+            .as_mut()
+            .ok_or(RtpSessionError::RtcpNotConfigured)?;
+        rtcp.poll(now, ntp_timestamp, rtp_timestamp, Some(&mut self.receive))
+            .map_err(RtpSessionError::Rtcp)
+    }
+
+    /// Builds final RTCP BYE under the session's local SSRC.
+    ///
+    /// # Errors
+    ///
+    /// Rejects use before configuration and preserves construction failures.
+    pub fn rtcp_goodbye(&self, reason: Option<&[u8]>) -> Result<Goodbye, RtpSessionError> {
+        self.rtcp
+            .as_ref()
+            .ok_or(RtpSessionError::RtcpNotConfigured)?
+            .goodbye(reason)
+            .map_err(RtpSessionError::Rtcp)
+    }
+
     /// Removes the next admitted packet for immediate `NetEq` insertion.
     pub fn pop_neteq_packet(&mut self) -> Option<NetEqPacket> {
         self.ingress.pop()
@@ -263,6 +402,7 @@ impl fmt::Debug for RtpSession {
             .field("security", &self.security)
             .field("ingress", &self.ingress.diagnostics())
             .field("source_resets", &self.source_resets)
+            .field("rtcp_configured", &self.rtcp.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -299,6 +439,12 @@ pub enum RtpSessionError {
     Liveness(MediaLivenessError),
     /// Queue could not be configured.
     Queue(QueueError),
+    /// Compound RTCP parsing or negotiated-policy validation failed.
+    CompoundRtcp(CompoundRtcpError),
+    /// RTCP scheduling or packet construction failed.
+    Rtcp(RtcpSchedulerError),
+    /// RTCP was used before session configuration.
+    RtcpNotConfigured,
     /// Packet payload ownership allocation failed.
     AllocationFailed,
 }
@@ -318,7 +464,9 @@ impl StdError for RtpSessionError {
             Self::Endpoint(error) => Some(error),
             Self::Liveness(error) => Some(error),
             Self::Queue(error) => Some(error),
-            Self::AllocationFailed => None,
+            Self::CompoundRtcp(error) => Some(error),
+            Self::Rtcp(error) => Some(error),
+            Self::AllocationFailed | Self::RtcpNotConfigured => None,
         }
     }
 }
@@ -328,9 +476,14 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
-    use super::{RtpIngressOutcome, RtpSession};
+    use super::{RtcpIngressOutcome, RtpIngressOutcome, RtpSession};
     use crate::rtp::clock::RtpClockRate;
     use crate::rtp::liveness::MediaLiveness;
+    use crate::rtp::packet::rtcp::{
+        CompoundPolicy, CompoundRtcp, RtcpPacket, RtcpSenderInfo, SdesChunk, SdesItem,
+        SdesItemType, SenderReport, SourceDescription,
+    };
+    use crate::rtp::rtcp_scheduler::{RtcpScheduleConfig, ScheduledReport};
     use crate::rtp::security::{MediaSecurityPolicy, PacketProtection};
     use crate::rtp::source::SourcePolicy;
     use crate::rtp::state::RtpReceiveConfig;
@@ -429,5 +582,77 @@ mod tests {
             ),
             Ok(RtpIngressOutcome::ClassifiedOut(_))
         ));
+    }
+
+    #[test]
+    fn session_owns_rtcp_ingress_timing_and_report_schedule() {
+        let mut session = session(MediaSecurityPolicy::PlainAllowed);
+        for sequence in 1..=3 {
+            assert!(
+                session
+                    .ingest_rtp(
+                        address(20_000),
+                        &packet(sequence),
+                        Duration::from_millis(u64::from(sequence) * 10),
+                        PacketProtection::Plain,
+                    )
+                    .is_ok()
+            );
+        }
+        session
+            .configure_rtcp(
+                RtcpScheduleConfig::default(),
+                9,
+                b"runtime@example.invalid",
+                CompoundPolicy::Strict,
+                Duration::ZERO,
+            )
+            .unwrap_or_else(|_| panic!("RTCP config"));
+
+        let sender = SenderReport::new(
+            7,
+            RtcpSenderInfo::new(0x0001_0002_0003_0004, 240, 3, 3),
+            &[],
+            0,
+        )
+        .unwrap_or_else(|_| panic!("sender report"));
+        let item = SdesItem::new(SdesItemType::CanonicalName, b"remote@example.invalid")
+            .unwrap_or_else(|_| panic!("item"));
+        let chunk = SdesChunk::new(7, &[item]).unwrap_or_else(|_| panic!("chunk"));
+        let description =
+            SourceDescription::new(&[chunk], 0).unwrap_or_else(|_| panic!("description"));
+        let compound = CompoundRtcp::new(
+            &[
+                RtcpPacket::SenderReport(sender),
+                RtcpPacket::SourceDescription(description),
+            ],
+            CompoundPolicy::Strict,
+        )
+        .unwrap_or_else(|_| panic!("compound"))
+        .encode()
+        .unwrap_or_else(|_| panic!("encode"));
+        assert!(matches!(
+            session.ingest_rtcp(
+                address(20_001),
+                &compound,
+                Duration::from_secs(1),
+                PacketProtection::Plain,
+            ),
+            Ok(RtcpIngressOutcome::Accepted {
+                sender_report: true,
+                packet_count: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            session.poll_rtcp(Duration::from_secs(5), 0, 400),
+            Ok(Some(ScheduledReport::Receiver { .. }))
+        ));
+        session.note_rtp_sent(160);
+        assert!(matches!(
+            session.poll_rtcp(Duration::from_secs(10), 1, 800),
+            Ok(Some(ScheduledReport::Sender { .. }))
+        ));
+        assert!(session.rtcp_goodbye(Some(b"normal")).is_ok());
     }
 }

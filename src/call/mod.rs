@@ -21,11 +21,21 @@ pub mod leg;
 pub mod lifecycle;
 /// Bounded generation-fenced call registry.
 pub mod manager;
+/// Explicit 3xx redirect handling policy.
+pub mod redirect;
 pub mod state;
 /// Call-level deadline identities.
 pub mod timers;
+/// Blind and attended transfer request/state machinery.
+pub mod transfer;
 
-pub use events::{CallAction, CallCommand, CallEvent};
+pub use events::{
+    CallAction, CallCommand, CallEvent, CallReference, TransferTarget, TransferTargetError,
+};
 pub use leg::{DialogBranchId, ForkSet};
 pub use lifecycle::{CallLifecycle, LifecycleError};
+pub use redirect::{RedirectDecision, RedirectError, RedirectHandler, RedirectPolicy};
 pub use state::{CallEndReason, CallState};
+pub use transfer::{
+    TransferError, TransferNotification, TransferRequestHeaders, TransferState, TransferTracker,
+};

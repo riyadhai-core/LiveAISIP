@@ -5,6 +5,8 @@
 // You may obtain a copy of the License at
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
@@ -33,12 +35,18 @@ pub enum TimelineEvent {
     InviteAccepted,
     /// Final failure response arrived.
     InviteRejected,
+    /// Local application requested call termination.
+    HangupRequested,
     /// ACK was emitted.
     AckSent,
     /// CANCEL was emitted.
     CancelSent,
     /// BYE was emitted.
     ByeSent,
+    /// Local application requested transfer.
+    TransferRequested,
+    /// A REFER transfer request was emitted.
+    TransferSent,
     /// Call reached terminal state.
     CallEnded,
     /// First valid RTP packet arrived.
@@ -51,6 +59,8 @@ pub enum TimelineEvent {
     QueueOverflow,
     /// Media activity deadline expired.
     MediaTimedOut,
+    /// SIP transaction or dialog deadline expired.
+    SignalingTimedOut,
     /// Signaling transport failed.
     TransportFailed,
 }
@@ -108,9 +118,7 @@ impl CallTimeline {
         event: TimelineEvent,
         detail: Option<u32>,
     ) -> Result<(), TimelineError> {
-        let elapsed = now
-            .checked_sub(self.started_at)
-            .ok_or(TimelineError::ClockMovedBackward)?;
+        let elapsed = self.elapsed_at(now)?;
         if self.entries.len() == self.capacity {
             self.entries.pop_front();
             self.overwritten = self.overwritten.saturating_add(1);
@@ -123,6 +131,15 @@ impl CallTimeline {
         Ok(())
     }
 
+    /// Validates a timestamp before state-changing work is performed.
+    ///
+    /// # Errors
+    ///
+    /// Rejects time before call creation.
+    pub fn validate_time(&self, now: Duration) -> Result<(), TimelineError> {
+        self.elapsed_at(now).map(|_| ())
+    }
+
     /// Returns retained entries oldest to newest.
     #[must_use]
     pub fn entries(&self) -> impl ExactSizeIterator<Item = &TimelineEntry> {
@@ -133,6 +150,11 @@ impl CallTimeline {
     #[must_use]
     pub const fn overwritten(&self) -> u64 {
         self.overwritten
+    }
+
+    fn elapsed_at(&self, now: Duration) -> Result<Duration, TimelineError> {
+        now.checked_sub(self.started_at)
+            .ok_or(TimelineError::ClockMovedBackward)
     }
 }
 

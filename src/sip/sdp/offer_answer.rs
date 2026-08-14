@@ -5,6 +5,8 @@
 // You may obtain a copy of the License at
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
@@ -206,10 +208,17 @@ mod tests {
     #[test]
     fn stale_generation_cannot_complete_new_offer() {
         let mut state = OfferAnswer::new();
-        let first = state.begin_local_offer().unwrap_or_else(|_| panic!("offer"));
+        let first = state
+            .begin_local_offer()
+            .unwrap_or_else(|_| panic!("offer"));
         assert!(state.abort(first).is_ok());
-        let second = state.begin_local_offer().unwrap_or_else(|_| panic!("offer"));
-        assert_eq!(state.apply_remote_answer(first), Err(OfferAnswerError::StaleToken));
+        let second = state
+            .begin_local_offer()
+            .unwrap_or_else(|_| panic!("offer"));
+        assert_eq!(
+            state.apply_remote_answer(first),
+            Err(OfferAnswerError::StaleToken)
+        );
         assert!(state.apply_remote_answer(second).is_ok());
     }
 }

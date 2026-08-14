@@ -20,9 +20,11 @@
 //! SIP client authentication primitives and challenge handling.
 
 pub mod challenge;
+pub mod context;
 pub mod digest;
 
 pub use challenge::{AuthChallenge, AuthParameter, ChallengeParseError};
+pub use context::{AuthContext, AuthContextError, AuthScope};
 pub use digest::{
     DigestAlgorithm, DigestAuthorization, DigestCredentials, DigestError, DigestRequest,
     QualityOfProtection,

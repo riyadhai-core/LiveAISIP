@@ -5,6 +5,8 @@
 // You may obtain a copy of the License at
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
@@ -18,7 +20,7 @@ use std::fmt;
 use std::time::Duration;
 
 use super::context::{CallContext, CallContextError};
-use super::events::{CallAction, CallEvent};
+use super::events::{CallAction, CallEvent, CallReference};
 
 /// Maximum calls configurable in one registry.
 pub const MAX_CALL_MANAGER_CAPACITY: usize = 1_000_000;
@@ -31,6 +33,12 @@ pub struct CallToken {
 }
 
 impl CallToken {
+    /// Returns a generation-fenced call reference for attended transfer.
+    #[must_use]
+    pub const fn reference(self) -> CallReference {
+        CallReference::new(self.call_id, self.generation)
+    }
+
     /// Returns application call identifier.
     #[must_use]
     pub const fn call_id(self) -> u64 {
