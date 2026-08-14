@@ -21,6 +21,7 @@
 
 pub mod clock;
 pub mod dtmf;
+pub mod error;
 pub mod liveness;
 pub mod packet;
 pub mod queue;

@@ -17,13 +17,19 @@
 /// Single-owner call actor context.
 pub mod context;
 pub mod events;
+/// External bounded capability for one native call owner.
+pub mod handle;
 pub mod leg;
 pub mod lifecycle;
 /// Bounded generation-fenced call registry.
 pub mod manager;
 /// Explicit 3xx redirect handling policy.
 pub mod redirect;
+/// Exclusive mutable state owner for one active call.
+pub mod runtime;
 pub mod state;
+/// Dedicated native OS-thread execution wrapper.
+pub mod thread;
 /// Call-level deadline identities.
 pub mod timers;
 /// Blind and attended transfer request/state machinery.
@@ -32,10 +38,19 @@ pub mod transfer;
 pub use events::{
     CallAction, CallCommand, CallEvent, CallReference, TransferTarget, TransferTargetError,
 };
+pub use handle::{
+    CallActionReceiveError, CallHandle, CallQueueSnapshot, CallStatusSnapshot, CallSubmitError,
+    CallSubmitErrorKind, CallThreadPhase, CallToken,
+};
 pub use leg::{DialogBranchId, ForkSet};
 pub use lifecycle::{CallLifecycle, LifecycleError};
 pub use redirect::{RedirectDecision, RedirectError, RedirectHandler, RedirectPolicy};
+pub use runtime::{
+    AudioDirection, CallMessage, CallRuntime, CallRuntimeConfig, CallRuntimeDiagnostics,
+    CallRuntimeError,
+};
 pub use state::{CallEndReason, CallState};
+pub use thread::{CallExit, CallExitKind, CallThread, CallThreadConfig, CallThreadError};
 pub use transfer::{
     TransferError, TransferNotification, TransferRequestHeaders, TransferState, TransferTracker,
 };

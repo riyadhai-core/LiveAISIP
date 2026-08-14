@@ -150,6 +150,10 @@ impl ReactorNotifier {
     ///
     /// Wake bytes are coalesced. A full nonblocking wake socket is success
     /// because it already guarantees pending readability.
+    ///
+    /// # Errors
+    ///
+    /// Preserves operating-system wake-socket write failure.
     pub fn notify(&self) -> io::Result<()> {
         let mut writer = &self.writer;
         match writer.write(&[1]) {
@@ -212,8 +216,6 @@ impl StdError for ReactorSourceError {
 /// One result produced by a bounded reactor turn.
 #[non_exhaustive]
 pub enum ReactorEvent {
-    /// A parsed and semantically validated inbound SIP message.
-    Inbound(ReceivedMessage),
     /// A malformed or otherwise rejected UDP datagram. The UDP socket remains
     /// active because one datagram cannot desynchronize later datagrams.
     DatagramRejected(ServiceError),
@@ -240,10 +242,53 @@ pub enum ReactorEvent {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchSlot {
+    Inbound(usize),
+    Event(usize),
+}
+
+/// Borrowed item in exact reactor processing order.
+#[derive(Clone, Copy, Debug)]
+pub enum ReactorBatchItem<'a> {
+    /// Parsed and semantically validated inbound SIP message.
+    Inbound(&'a ReceivedMessage),
+    /// Transport commit, rejection, failure, or graceful-close event.
+    Event(&'a ReactorEvent),
+}
+
+/// Iterator over one batch in exact reactor processing order.
+pub struct ReactorBatchIter<'a> {
+    batch: &'a ReactorBatch,
+    offset: usize,
+}
+
+impl<'a> Iterator for ReactorBatchIter<'a> {
+    type Item = ReactorBatchItem<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let slot = *self.batch.order.get(self.offset)?;
+        self.offset += 1;
+        match slot {
+            BatchSlot::Inbound(index) => {
+                self.batch.inbound.get(index).map(ReactorBatchItem::Inbound)
+            }
+            BatchSlot::Event(index) => self.batch.events.get(index).map(ReactorBatchItem::Event),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.batch.order.len().saturating_sub(self.offset);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for ReactorBatchIter<'_> {}
+impl std::iter::FusedIterator for ReactorBatchIter<'_> {}
+
 impl fmt::Debug for ReactorEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Inbound(message) => formatter.debug_tuple("Inbound").field(message).finish(),
             Self::DatagramRejected(error) => formatter
                 .debug_struct("DatagramRejected")
                 .field("class", &error.class())
@@ -276,15 +321,32 @@ impl fmt::Debug for ReactorEvent {
 
 /// Results from one bounded reactor wait/drain turn.
 pub struct ReactorBatch {
+    inbound: Vec<ReceivedMessage>,
     events: Vec<ReactorEvent>,
+    order: Vec<BatchSlot>,
     notified: bool,
 }
 
 impl ReactorBatch {
+    /// Returns parsed and semantically validated inbound messages in receive order.
+    #[must_use]
+    pub fn inbound(&self) -> &[ReceivedMessage] {
+        &self.inbound
+    }
+
     /// Returns events in reactor processing order.
     #[must_use]
     pub fn events(&self) -> &[ReactorEvent] {
         &self.events
+    }
+
+    /// Iterates inbound messages and transport events in exact processing order.
+    #[must_use]
+    pub const fn iter(&self) -> ReactorBatchIter<'_> {
+        ReactorBatchIter {
+            batch: self,
+            offset: 0,
+        }
     }
 
     /// Returns whether an explicit notifier wake was consumed.
@@ -292,11 +354,14 @@ impl ReactorBatch {
     pub const fn notified(&self) -> bool {
         self.notified
     }
+}
 
-    /// Consumes this batch into its events.
-    #[must_use]
-    pub fn into_events(self) -> Vec<ReactorEvent> {
-        self.events
+impl<'a> IntoIterator for &'a ReactorBatch {
+    type Item = ReactorBatchItem<'a>;
+    type IntoIter = ReactorBatchIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -304,7 +369,9 @@ impl fmt::Debug for ReactorBatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ReactorBatch")
+            .field("inbound", &self.inbound.len())
             .field("events", &self.events.len())
+            .field("ordered_items", &self.order.len())
             .field("notified", &self.notified)
             .finish_non_exhaustive()
     }
@@ -410,6 +477,10 @@ impl TransportReactor {
     }
 
     /// Plans or reuses one reliable destination without blocking connection I/O.
+    ///
+    /// # Errors
+    ///
+    /// Preserves transport planning, shutdown, capacity, and allocation failure.
     pub fn plan_reliable(
         &mut self,
         destination: Destination,
@@ -420,6 +491,11 @@ impl TransportReactor {
     }
 
     /// Attaches and registers one established nonblocking TCP driver.
+    ///
+    /// # Errors
+    ///
+    /// Rejects blocking/mismatched drivers and preserves attachment,
+    /// registration, allocation, and rollback failure.
     pub fn attach_tcp(&mut self, id: ConnectionId, driver: TcpDriver) -> Result<(), ReactorError> {
         if !driver.config().nonblocking() {
             return Err(ReactorError::BlockingReliableDriver);
@@ -432,6 +508,11 @@ impl TransportReactor {
     }
 
     /// Attaches and registers one verified nonblocking TLS driver.
+    ///
+    /// # Errors
+    ///
+    /// Rejects blocking/mismatched/unverified drivers and preserves attachment,
+    /// registration, allocation, and rollback failure.
     pub fn attach_tls(&mut self, id: ConnectionId, driver: TlsDriver) -> Result<(), ReactorError> {
         if !driver.nonblocking() {
             return Err(ReactorError::BlockingReliableDriver);
@@ -444,6 +525,11 @@ impl TransportReactor {
     }
 
     /// Admits a reliable message and arms socket writability.
+    ///
+    /// # Errors
+    ///
+    /// Preserves queue admission, registration re-arm, and failure-recovery
+    /// errors.
     pub fn enqueue_reliable(
         &mut self,
         id: ConnectionId,
@@ -456,6 +542,11 @@ impl TransportReactor {
     }
 
     /// Sends one response through authoritative ingress routing.
+    ///
+    /// # Errors
+    ///
+    /// Preserves route, UDP send, reliable admission, re-arm, and recovery
+    /// failures.
     pub fn send_route(
         &mut self,
         route: EgressRoute,
@@ -473,6 +564,10 @@ impl TransportReactor {
 
     /// Fences new work, unregisters UDP ingress, and makes every reliable flow
     /// writable so queued data and graceful close can advance.
+    ///
+    /// # Errors
+    ///
+    /// Preserves native readiness removal or re-arm failure.
     pub fn begin_shutdown(&mut self) -> Result<(), ReactorError> {
         if self.udp_registered {
             self.poller
@@ -497,6 +592,11 @@ impl TransportReactor {
     ///
     /// `None` waits indefinitely until I/O or a notifier wake. A synthetic
     /// continuation never blocks because it represents already-buffered work.
+    ///
+    /// # Errors
+    ///
+    /// Preserves bounded allocation, poller wait/re-arm, wake-socket,
+    /// transport-driver, graceful-shutdown, and recovery failures.
     pub fn poll(&mut self, timeout: Option<Duration>) -> Result<ReactorBatch, ReactorError> {
         self.ready.clear();
         self.collect_continuations();
@@ -507,8 +607,16 @@ impl TransportReactor {
             coalesce_ready(&mut self.ready);
         }
 
+        let mut inbound = Vec::new();
+        inbound
+            .try_reserve(self.config.ready_events)
+            .map_err(|_| ReactorError::AllocationFailed)?;
         let mut events = Vec::new();
         events
+            .try_reserve_exact(self.config.batch_events())
+            .map_err(|_| ReactorError::AllocationFailed)?;
+        let mut order = Vec::new();
+        order
             .try_reserve_exact(self.config.batch_events())
             .map_err(|_| ReactorError::AllocationFailed)?;
         let mut notified = false;
@@ -527,7 +635,7 @@ impl TransportReactor {
                     if ready.terminal {
                         return Err(ReactorError::UdpReadinessTerminal);
                     }
-                    self.process_udp(&mut events);
+                    self.process_udp(&mut inbound, &mut events, &mut order)?;
                     self.poller
                         .modify(self.udp_source.as_raw_fd(), UDP_KEY, Interest::READ)
                         .map_err(ReactorError::PollerModify)?;
@@ -536,12 +644,17 @@ impl TransportReactor {
                     let Some(id) = self.by_key.get(&key).copied() else {
                         continue;
                     };
-                    self.process_reliable(id, ready, &mut events)?;
+                    self.process_reliable(id, ready, &mut inbound, &mut events, &mut order)?;
                 }
             }
         }
 
-        Ok(ReactorBatch { events, notified })
+        Ok(ReactorBatch {
+            inbound,
+            events,
+            order,
+            notified,
+        })
     }
 
     fn register_reliable(&mut self, id: ConnectionId) -> Result<(), ReactorError> {
@@ -635,46 +748,59 @@ impl TransportReactor {
             self.ready.push(OsReady {
                 key,
                 readable: true,
-                writable: false,
+                writable: self.service.reliable_wants_write(id),
                 terminal: false,
             });
         }
     }
 
-    fn process_udp(&mut self, events: &mut Vec<ReactorEvent>) {
+    fn process_udp(
+        &mut self,
+        inbound: &mut Vec<ReceivedMessage>,
+        events: &mut Vec<ReactorEvent>,
+        order: &mut Vec<BatchSlot>,
+    ) -> Result<(), ReactorError> {
         for _ in 0..self.config.reads_per_source {
             match self.service.receive_udp() {
-                Ok(message) => events.push(ReactorEvent::Inbound(message)),
+                Ok(message) => push_inbound(inbound, order, message)?,
                 Err(error) if is_would_block(&error) => break,
                 Err(error) => {
                     let persistent_io = service_io_kind(&error).is_some();
-                    events.push(ReactorEvent::DatagramRejected(error));
+                    push_event(events, order, ReactorEvent::DatagramRejected(error));
                     if persistent_io {
                         break;
                     }
                 }
             }
         }
+        Ok(())
     }
 
     fn process_reliable(
         &mut self,
         id: ConnectionId,
         ready: OsReady,
+        inbound: &mut Vec<ReceivedMessage>,
         events: &mut Vec<ReactorEvent>,
+        order: &mut Vec<BatchSlot>,
     ) -> Result<(), ReactorError> {
         let mut still_active = true;
         if ready.readable {
             let mut exhausted = true;
             for _ in 0..self.config.reads_per_source {
                 match self.service.receive_reliable(id) {
-                    Ok(message) => events.push(ReactorEvent::Inbound(message)),
+                    Ok(message) => push_inbound(inbound, order, message)?,
                     Err(error) if is_would_block(&error) => {
                         exhausted = false;
                         break;
                     }
                     Err(error) => {
-                        self.fail_reliable(id, ReactorSourceError::Transport(error), events)?;
+                        self.fail_reliable(
+                            id,
+                            ReactorSourceError::Transport(error),
+                            events,
+                            order,
+                        )?;
                         still_active = false;
                         exhausted = false;
                         break;
@@ -691,21 +817,25 @@ impl TransportReactor {
                 Ok(batch) => {
                     let committed = batch.into_committed();
                     if !committed.is_empty() {
-                        events.push(ReactorEvent::ReliableCommitted {
-                            connection_id: id,
-                            messages: committed,
-                        });
+                        push_event(
+                            events,
+                            order,
+                            ReactorEvent::ReliableCommitted {
+                                connection_id: id,
+                                messages: committed,
+                            },
+                        );
                     }
                 }
                 Err(error) => {
-                    self.fail_reliable(id, ReactorSourceError::Transport(error), events)?;
+                    self.fail_reliable(id, ReactorSourceError::Transport(error), events, order)?;
                     still_active = false;
                 }
             }
         }
 
         if still_active && ready.terminal {
-            self.fail_reliable(id, ReactorSourceError::ReadinessTerminal, events)?;
+            self.fail_reliable(id, ReactorSourceError::ReadinessTerminal, events, order)?;
             still_active = false;
         }
 
@@ -718,20 +848,22 @@ impl TransportReactor {
                 Ok(ServiceShutdownProgress::Complete) => {
                     self.remove_registration(id)
                         .map_err(ReactorError::PollerModify)?;
-                    events.push(ReactorEvent::ReliableClosed { connection_id: id });
+                    push_event(
+                        events,
+                        order,
+                        ReactorEvent::ReliableClosed { connection_id: id },
+                    );
                     still_active = false;
                 }
                 Err(error) => {
-                    self.fail_reliable(id, ReactorSourceError::Transport(error), events)?;
+                    self.fail_reliable(id, ReactorSourceError::Transport(error), events, order)?;
                     still_active = false;
                 }
             }
         }
 
-        if still_active {
-            if let Err(source) = self.rearm_reliable(id) {
-                self.fail_reliable(id, ReactorSourceError::Readiness(source), events)?;
-            }
+        if still_active && let Err(source) = self.rearm_reliable(id) {
+            self.fail_reliable(id, ReactorSourceError::Readiness(source), events, order)?;
         }
         Ok(())
     }
@@ -778,21 +910,26 @@ impl TransportReactor {
         id: ConnectionId,
         mut error: ReactorSourceError,
         events: &mut Vec<ReactorEvent>,
+        order: &mut Vec<BatchSlot>,
     ) -> Result<(), ReactorError> {
-        if let Err(source) = self.remove_registration(id) {
-            if matches!(error, ReactorSourceError::ReadinessTerminal) {
-                error = ReactorSourceError::Readiness(source);
-            }
+        if let Err(source) = self.remove_registration(id)
+            && matches!(error, ReactorSourceError::ReadinessTerminal)
+        {
+            error = ReactorSourceError::Readiness(source);
         }
         let recovery = self
             .service
             .fail_connection(id)
             .map_err(ReactorError::Service)?;
-        events.push(ReactorEvent::ReliableFailed {
-            connection_id: id,
-            error,
-            recovery,
-        });
+        push_event(
+            events,
+            order,
+            ReactorEvent::ReliableFailed {
+                connection_id: id,
+                error,
+                recovery,
+            },
+        );
         Ok(())
     }
 
@@ -854,6 +991,28 @@ fn service_io_kind(error: &ServiceError) -> Option<io::ErrorKind> {
         ServiceError::Tls(source) => source.io_kind(),
         _ => None,
     }
+}
+
+fn push_inbound(
+    inbound: &mut Vec<ReceivedMessage>,
+    order: &mut Vec<BatchSlot>,
+    message: ReceivedMessage,
+) -> Result<(), ReactorError> {
+    if inbound.len() == inbound.capacity() {
+        inbound
+            .try_reserve(1)
+            .map_err(|_| ReactorError::AllocationFailed)?;
+    }
+    let index = inbound.len();
+    inbound.push(message);
+    order.push(BatchSlot::Inbound(index));
+    Ok(())
+}
+
+fn push_event(events: &mut Vec<ReactorEvent>, order: &mut Vec<BatchSlot>, event: ReactorEvent) {
+    let index = events.len();
+    events.push(event);
+    order.push(BatchSlot::Event(index));
 }
 
 fn coalesce_ready(ready: &mut Vec<OsReady>) {
@@ -1205,6 +1364,11 @@ impl OsPoller {
         }
         // SAFETY: successful `kqueue` transfers unique descriptor ownership.
         let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: `descriptor` is live and `F_SETFD` consumes only the integer
+        // flag value. Ownership remains with `descriptor` on every outcome.
+        if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
         let mut events = Vec::new();
         events.try_reserve_exact(capacity).map_err(|_| {
             io::Error::new(io::ErrorKind::OutOfMemory, "kqueue event allocation failed")
@@ -1284,13 +1448,15 @@ impl OsPoller {
     }
 
     fn change(&self, source: RawFd, key: usize, filter: i16, enable: bool) -> io::Result<()> {
+        let ident = libc::uintptr_t::try_from(source)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative descriptor"))?;
         let flags = if enable {
             libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT
         } else {
             libc::EV_DELETE
         };
         let change = libc::kevent {
-            ident: source as libc::uintptr_t,
+            ident,
             filter,
             flags,
             fflags: 0,
@@ -1302,7 +1468,7 @@ impl OsPoller {
         let result = unsafe {
             libc::kevent(
                 self.descriptor.as_raw_fd(),
-                &change,
+                &raw const change,
                 1,
                 std::ptr::null_mut(),
                 0,
@@ -1364,8 +1530,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        MAX_BATCH_EVENTS, MAX_READS_PER_SOURCE, MAX_READY_EVENTS, ReactorConfig, ReactorError,
-        ReactorEvent, TransportReactor, coalesce_ready,
+        MAX_BATCH_EVENTS, MAX_READS_PER_SOURCE, MAX_READY_EVENTS, ReactorBatchItem, ReactorConfig,
+        ReactorError, ReactorEvent, TransportReactor, coalesce_ready,
     };
     use crate::sip::transport::connection::QueueLimits;
     use crate::sip::transport::destination::Destination;
@@ -1420,13 +1586,6 @@ Content-Length: 0\r\n\r\n";
             ReactorConfig::new(32, reads_per_source).unwrap_or_else(|_| panic!("reactor config")),
         )
         .unwrap_or_else(|_| panic!("reactor"))
-    }
-
-    fn count_inbound(events: &[ReactorEvent]) -> usize {
-        events
-            .iter()
-            .filter(|event| matches!(event, ReactorEvent::Inbound(_)))
-            .count()
     }
 
     #[test]
@@ -1498,16 +1657,40 @@ Content-Length: 0\r\n\r\n";
         assert!(sender.send_to(b"not SIP", target).is_ok());
         assert!(sender.send_to(UDP_REQUEST, target).is_ok());
 
-        let batch = reactor
+        let first = reactor
             .poll(Some(Duration::from_secs(1)))
             .unwrap_or_else(|_| panic!("poll"));
-        assert_eq!(count_inbound(batch.events()), 1);
         assert!(
-            batch
+            first
                 .events()
                 .iter()
                 .any(|event| matches!(event, ReactorEvent::DatagramRejected(_)))
         );
+        let first_ordered = first.iter().collect::<Vec<_>>();
+        assert!(matches!(
+            first_ordered.first(),
+            Some(ReactorBatchItem::Event(ReactorEvent::DatagramRejected(_)))
+        ));
+
+        if first.inbound().is_empty() {
+            let second = reactor
+                .poll(Some(Duration::from_secs(1)))
+                .unwrap_or_else(|_| panic!("second poll"));
+            assert_eq!(second.inbound().len(), 1);
+            assert!(matches!(
+                second.iter().next(),
+                Some(ReactorBatchItem::Inbound(_))
+            ));
+        } else {
+            assert_eq!(first.inbound().len(), 1);
+            assert!(matches!(
+                first_ordered.as_slice(),
+                [
+                    ReactorBatchItem::Event(ReactorEvent::DatagramRejected(_)),
+                    ReactorBatchItem::Inbound(_)
+                ]
+            ));
+        }
     }
 
     #[test]
@@ -1543,11 +1726,11 @@ Content-Length: 0\r\n\r\n";
         let first = reactor
             .poll(Some(Duration::from_secs(1)))
             .unwrap_or_else(|_| panic!("first poll"));
-        assert_eq!(count_inbound(first.events()), 1);
+        assert_eq!(first.inbound().len(), 1);
         let second = reactor
             .poll(Some(Duration::ZERO))
             .unwrap_or_else(|_| panic!("continuation poll"));
-        assert_eq!(count_inbound(second.events()), 1);
+        assert_eq!(second.inbound().len(), 1);
 
         let outbound: Arc<[u8]> = Arc::from(TCP_REQUEST);
         reactor
@@ -1556,13 +1739,16 @@ Content-Length: 0\r\n\r\n";
         let committed = reactor
             .poll(Some(Duration::from_secs(1)))
             .unwrap_or_else(|_| panic!("write poll"));
-        assert!(committed.events().iter().any(|event| matches!(
-            event,
-            ReactorEvent::ReliableCommitted {
-                connection_id,
-                messages
-            } if *connection_id == plan.id() && messages.len() == 1
-        )));
+        assert!(
+            committed.events().iter().any(|event| matches!(
+                event,
+                ReactorEvent::ReliableCommitted {
+                    connection_id,
+                    messages
+                } if *connection_id == plan.id() && messages.len() == 1
+            )),
+            "unexpected write batch: {committed:?}"
+        );
         let mut received = vec![0_u8; outbound.len()];
         peer.set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap_or_else(|_| panic!("read timeout"));

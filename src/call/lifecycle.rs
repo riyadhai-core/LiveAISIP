@@ -231,6 +231,17 @@ impl CallLifecycle {
         self.state = CallState::Ended(reason);
         vec![CallAction::Ended(reason)]
     }
+
+    /// Forces one terminal transition during runtime containment or shutdown.
+    ///
+    /// Repeated calls are idempotent and emit no duplicate terminal action.
+    pub(crate) fn force_end(&mut self, reason: CallEndReason) -> Vec<CallAction> {
+        if self.state.is_terminal() {
+            Vec::new()
+        } else {
+            self.end(reason)
+        }
+    }
 }
 
 impl fmt::Debug for CallLifecycle {

@@ -21,6 +21,7 @@ use crate::sip::headers::via::Via;
 use crate::sip::serializer::message::{self, SerializeError};
 use crate::sip::types::header::{Header, HeaderKind};
 use crate::sip::types::method::Method;
+use crate::sip::types::request::Request;
 use crate::sip::types::uri::Uri;
 use crate::sip::types::version::Version;
 
@@ -158,6 +159,14 @@ impl RequestBuilder {
     #[must_use]
     pub fn body(&self) -> &[u8] {
         &self.body
+    }
+
+    /// Finishes construction as an immutable canonical request.
+    ///
+    /// Existing header and body storage is moved without copying or allocating.
+    #[must_use]
+    pub fn build(self) -> Request {
+        Request::from_builder_parts(self.method, self.uri, self.headers.into_vec(), self.body)
     }
 
     /// Serializes the complete request with authoritative Content-Length.

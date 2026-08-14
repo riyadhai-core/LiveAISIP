@@ -26,3 +26,26 @@ pub enum CallTimer {
     /// Transfer completion deadline.
     Transfer,
 }
+
+impl CallTimer {
+    pub(crate) const fn kind(self) -> u16 {
+        match self {
+            Self::NoAnswer => 1,
+            Self::SessionRefresh => 2,
+            Self::MediaInactivity => 3,
+            Self::TransportLiveness => 4,
+            Self::Transfer => 5,
+        }
+    }
+
+    pub(crate) const fn from_kind(kind: u16) -> Option<Self> {
+        match kind {
+            1 => Some(Self::NoAnswer),
+            2 => Some(Self::SessionRefresh),
+            3 => Some(Self::MediaInactivity),
+            4 => Some(Self::TransportLiveness),
+            5 => Some(Self::Transfer),
+            _ => None,
+        }
+    }
+}

@@ -18,21 +18,16 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::time::Duration;
 
-use crate::observability::{CallTimeline, TimelineError, TimelineEvent};
-use crate::rtp::queue::{BoundedQueue, OverflowPolicy, PushOutcome, QueueDiagnostics, QueueError};
-
 use super::events::{CallAction, CallCommand, CallEvent};
 use super::lifecycle::{CallLifecycle, LifecycleError};
+use crate::observability::{CallTimeline, TimelineError, TimelineEvent};
 
-/// Default serialized event mailbox capacity per call.
-pub const DEFAULT_CALL_MAILBOX_CAPACITY: usize = 256;
 /// Default retained privacy-safe timeline events per call.
 pub const DEFAULT_CALL_TIMELINE_CAPACITY: usize = 256;
 
-/// Actor-owned state; producers may enqueue but cannot mutate lifecycle.
+/// Actor-owned call state, mutated only by its owning [`super::runtime::CallRuntime`].
 pub struct CallContext {
     lifecycle: CallLifecycle,
-    inbox: BoundedQueue<CallEvent>,
     timeline: CallTimeline,
 }
 
@@ -41,45 +36,25 @@ impl CallContext {
     ///
     /// # Errors
     ///
-    /// Preserves lifecycle, mailbox and timeline allocation/configuration failures.
-    pub fn new(
-        started_at: Duration,
-        mailbox_capacity: usize,
-        timeline_capacity: usize,
-    ) -> Result<Self, CallContextError> {
+    /// Preserves lifecycle and timeline allocation/configuration failures.
+    pub fn new(started_at: Duration, timeline_capacity: usize) -> Result<Self, CallContextError> {
         Ok(Self {
             lifecycle: CallLifecycle::new().map_err(CallContextError::Lifecycle)?,
-            inbox: BoundedQueue::new(mailbox_capacity, OverflowPolicy::DropNewest)
-                .map_err(CallContextError::Queue)?,
             timeline: CallTimeline::new(started_at, timeline_capacity)
                 .map_err(CallContextError::Timeline)?,
         })
     }
 
-    /// Enqueues one external event without mutating call state.
-    ///
-    /// # Errors
-    ///
-    /// Returns the event when bounded mailbox is full.
-    pub fn submit(&mut self, event: CallEvent) -> Result<(), CallEvent> {
-        match self.inbox.push(event) {
-            PushOutcome::Accepted => Ok(()),
-            PushOutcome::DroppedNewest(event) | PushOutcome::DroppedOldest(event) => Err(event),
-        }
-    }
-
-    /// Lets the sole actor consume and mutate exactly one event.
+    /// Applies exactly one event under the call runtime's exclusive authority.
     ///
     /// # Errors
     ///
     /// Preserves lifecycle and timeline failures.
-    pub fn process_next(
+    pub fn handle(
         &mut self,
+        event: CallEvent,
         now: Duration,
-    ) -> Result<Option<Vec<CallAction>>, CallContextError> {
-        let Some(event) = self.inbox.pop() else {
-            return Ok(None);
-        };
+    ) -> Result<Vec<CallAction>, CallContextError> {
         self.timeline
             .validate_time(now)
             .map_err(CallContextError::Timeline)?;
@@ -101,7 +76,7 @@ impl CallContext {
                     .map_err(CallContextError::Timeline)?;
             }
         }
-        Ok(Some(actions))
+        Ok(actions)
     }
 
     /// Returns immutable lifecycle for observations only.
@@ -110,10 +85,8 @@ impl CallContext {
         &self.lifecycle
     }
 
-    /// Returns mailbox metrics.
-    #[must_use]
-    pub fn mailbox_diagnostics(&self) -> QueueDiagnostics {
-        self.inbox.diagnostics()
+    pub(crate) fn force_end(&mut self, reason: super::state::CallEndReason) -> Vec<CallAction> {
+        self.lifecycle.force_end(reason)
     }
 
     /// Returns bounded call timeline.
@@ -128,7 +101,6 @@ impl fmt::Debug for CallContext {
         formatter
             .debug_struct("CallContext")
             .field("lifecycle", &self.lifecycle)
-            .field("mailbox", &self.inbox.diagnostics())
             .field("timeline_entries", &self.timeline.entries().len())
             .finish_non_exhaustive()
     }
@@ -180,8 +152,6 @@ fn timeline_detail(event: &CallEvent) -> Option<u32> {
 pub enum CallContextError {
     /// Lifecycle rejected the serialized event.
     Lifecycle(LifecycleError),
-    /// Mailbox construction failed.
-    Queue(QueueError),
     /// Timeline creation or recording failed.
     Timeline(TimelineError),
 }
@@ -196,7 +166,6 @@ impl StdError for CallContextError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Lifecycle(error) => Some(error),
-            Self::Queue(error) => Some(error),
             Self::Timeline(error) => Some(error),
         }
     }
@@ -211,39 +180,20 @@ mod tests {
 
     #[test]
     fn only_actor_processing_mutates_lifecycle() {
-        let Ok(mut context) = CallContext::new(Duration::ZERO, 2, 4) else {
+        let Ok(mut context) = CallContext::new(Duration::ZERO, 4) else {
             panic!("context")
         };
-        assert!(
-            context
-                .submit(CallEvent::Command(CallCommand::Start))
-                .is_ok()
-        );
         assert_eq!(
             context.lifecycle().state(),
             crate::call::state::CallState::Idle
         );
         assert!(matches!(
-            context.process_next(Duration::from_millis(1)),
-            Ok(Some(actions)) if actions == vec![CallAction::SendInvite]
+            context.handle(CallEvent::Command(CallCommand::Start), Duration::from_millis(1)),
+            Ok(actions) if actions == vec![CallAction::SendInvite]
         ));
         assert_eq!(
             context.lifecycle().state(),
             crate::call::state::CallState::Inviting
         );
-    }
-
-    #[test]
-    fn mailbox_is_bounded_and_observable() {
-        let Ok(mut context) = CallContext::new(Duration::ZERO, 1, 4) else {
-            panic!("context")
-        };
-        assert!(
-            context
-                .submit(CallEvent::Command(CallCommand::Start))
-                .is_ok()
-        );
-        assert!(context.submit(CallEvent::TransportFailed).is_err());
-        assert_eq!(context.mailbox_diagnostics().overflows, 1);
     }
 }

@@ -12,66 +12,53 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bounded generation-fenced call actor registry.
+//! Bounded registry of external call capabilities.
+//!
+//! The manager never stores or exposes mutable call internals. Every entry is
+//! only a [`CallHandle`](super::handle::CallHandle); the dedicated native call
+//! thread exclusively owns [`CallRuntime`](super::runtime::CallRuntime).
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::time::Duration;
 
-use super::context::{CallContext, CallContextError};
-use super::events::{CallAction, CallEvent, CallReference};
+use super::events::{CallAction, CallEvent};
+use super::handle::{CallActionReceiveError, CallHandle, CallSubmitErrorKind, CallToken};
+use super::runtime::{CallMessage, CallRuntime};
+use super::thread::{CallExit, CallThread, CallThreadConfig, CallThreadError};
 
 /// Maximum calls configurable in one registry.
 pub const MAX_CALL_MANAGER_CAPACITY: usize = 1_000_000;
 
-/// Generation-fenced capability for one actor instance.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CallToken {
-    call_id: u64,
-    generation: u64,
-}
-
-impl CallToken {
-    /// Returns a generation-fenced call reference for attended transfer.
-    #[must_use]
-    pub const fn reference(self) -> CallReference {
-        CallReference::new(self.call_id, self.generation)
-    }
-
-    /// Returns application call identifier.
-    #[must_use]
-    pub const fn call_id(self) -> u64 {
-        self.call_id
-    }
-
-    /// Returns nonreused registry generation.
-    #[must_use]
-    pub const fn generation(self) -> u64 {
-        self.generation
-    }
-}
-
-struct Entry {
-    generation: u64,
-    context: CallContext,
-}
-
-/// Registry that routes events but never exposes mutable call state.
+/// Handle-only active call registry.
 pub struct CallManager {
-    calls: HashMap<u64, Entry>,
+    calls: HashMap<u64, CallHandle>,
     capacity: usize,
     next_generation: u64,
     accepting: bool,
+    thread_config: CallThreadConfig,
 }
 
 impl CallManager {
-    /// Creates a bounded registry.
+    /// Creates a bounded registry with default call-thread resources.
     ///
     /// # Errors
     ///
     /// Rejects zero/excessive capacity or allocation failure.
     pub fn new(capacity: usize) -> Result<Self, CallManagerError> {
+        Self::with_thread_config(capacity, CallThreadConfig::default())
+    }
+
+    /// Creates a registry with explicit native stack and mailbox capacities.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero/excessive capacity or allocation failure.
+    pub fn with_thread_config(
+        capacity: usize,
+        thread_config: CallThreadConfig,
+    ) -> Result<Self, CallManagerError> {
         if capacity == 0 || capacity > MAX_CALL_MANAGER_CAPACITY {
             return Err(CallManagerError::InvalidCapacity);
         }
@@ -84,18 +71,25 @@ impl CallManager {
             capacity,
             next_generation: 1,
             accepting: true,
+            thread_config,
         })
     }
 
-    /// Admits one new actor under caller-assigned opaque ID.
+    /// Moves one fully allocated runtime into exactly one dedicated OS thread.
+    ///
+    /// Call validation, admission acquisition, and call-local allocation must
+    /// already have succeeded before this boundary. Registry capacity is
+    /// reserved before spawn, so successful thread creation cannot be followed
+    /// by a fallible insertion allocation.
     ///
     /// # Errors
     ///
-    /// Rejects shutdown, duplicate ID, capacity, generation exhaustion or allocation failure.
-    pub fn insert(
+    /// Rejects shutdown, duplicate identity, capacity/generation exhaustion,
+    /// allocation failure, or native thread creation failure.
+    pub fn spawn(
         &mut self,
         call_id: u64,
-        context: CallContext,
+        runtime: CallRuntime,
     ) -> Result<CallToken, CallManagerError> {
         if !self.accepting {
             return Err(CallManagerError::ShuttingDown);
@@ -103,147 +97,291 @@ impl CallManager {
         if self.calls.contains_key(&call_id) {
             return Err(CallManagerError::DuplicateCall);
         }
-        if self.calls.len() == self.capacity {
+        if self.calls.len() >= self.capacity {
             return Err(CallManagerError::AtCapacity);
         }
         let generation = self.next_generation;
-        self.next_generation = self
-            .next_generation
+        let next_generation = generation
             .checked_add(1)
             .ok_or(CallManagerError::GenerationExhausted)?;
         self.calls
             .try_reserve(1)
             .map_err(|_| CallManagerError::AllocationFailed)?;
-        self.calls.insert(
-            call_id,
-            Entry {
-                generation,
-                context,
-            },
-        );
-        Ok(CallToken {
-            call_id,
-            generation,
-        })
+        let token = CallToken::new(call_id, generation);
+        let spawned = CallThread::spawn(token, runtime, self.thread_config)
+            .map_err(CallManagerError::Thread)?;
+        let handle = CallHandle::from_spawned(token, spawned);
+        self.calls.insert(call_id, handle);
+        self.next_generation = next_generation;
+        Ok(token)
     }
 
-    /// Routes an event into one bounded actor mailbox.
+    /// Routes one event through the bounded call mailbox.
     ///
     /// # Errors
     ///
-    /// Rejects missing/stale actors or mailbox overflow.
-    pub fn submit(&mut self, token: CallToken, event: CallEvent) -> Result<(), CallManagerError> {
-        let entry = self.entry_mut(token)?;
-        entry
-            .context
-            .submit(event)
-            .map_err(|_| CallManagerError::MailboxFull)
+    /// Rejects unknown/stale calls, full mailbox, or closed owner thread.
+    pub fn submit(&self, token: CallToken, event: CallEvent) -> Result<(), CallManagerError> {
+        self.submit_message(token, CallMessage::Event(event))
     }
 
-    /// Processes one queued event under the actor's exclusive authority.
+    /// Routes one complete message through the bounded call mailbox.
     ///
     /// # Errors
     ///
-    /// Rejects missing/stale actors or context processing failure.
-    pub fn process_next(
-        &mut self,
+    /// Rejects unknown/stale calls, full mailbox, or closed owner thread.
+    pub fn submit_message(
+        &self,
         token: CallToken,
-        now: Duration,
+        message: CallMessage,
+    ) -> Result<(), CallManagerError> {
+        self.entry(token)?
+            .submit(message)
+            .map_err(|error| match error.kind() {
+                CallSubmitErrorKind::Full => CallManagerError::MailboxFull,
+                CallSubmitErrorKind::Closed => CallManagerError::CallClosed,
+            })
+    }
+
+    /// Tries to receive one action batch already produced by the call thread.
+    ///
+    /// `now` is retained for source compatibility; all mutation and clock
+    /// evaluation now occur inside the owner thread.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown/stale calls or a closed action queue.
+    pub fn process_next(
+        &self,
+        token: CallToken,
+        _now: Duration,
     ) -> Result<Option<Vec<CallAction>>, CallManagerError> {
-        self.entry_mut(token)?
-            .context
-            .process_next(now)
-            .map_err(CallManagerError::Context)
+        self.entry(token)?
+            .try_recv_actions()
+            .map_err(|CallActionReceiveError::Closed| CallManagerError::CallClosed)
     }
 
-    /// Removes exact actor generation, preventing delayed work reaching reuse.
-    pub fn remove(&mut self, token: CallToken) -> Option<CallContext> {
-        if self
+    /// Waits for one owner-produced action batch for at most `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown/stale calls or a closed action queue.
+    pub fn receive_actions(
+        &self,
+        token: CallToken,
+        timeout: Duration,
+    ) -> Result<Option<Vec<CallAction>>, CallManagerError> {
+        self.entry(token)?
+            .recv_actions_timeout(timeout)
+            .map_err(|CallActionReceiveError::Closed| CallManagerError::CallClosed)
+    }
+
+    /// Returns a cloned external capability without exposing runtime state.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown or stale generation tokens.
+    pub fn handle(&self, token: CallToken) -> Result<CallHandle, CallManagerError> {
+        Ok(self.entry(token)?.clone())
+    }
+
+    /// Requests shutdown, removes, and joins one exact call generation.
+    ///
+    /// The registry entry is removed before joining, so no manager collection
+    /// mutation is held across the native wait.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown/stale calls or native join failure.
+    pub fn remove(&mut self, token: CallToken) -> Result<CallExit, CallManagerError> {
+        self.verify(token)?;
+        let handle = self
             .calls
-            .get(&token.call_id)
-            .is_some_and(|entry| entry.generation == token.generation)
-        {
-            self.calls.remove(&token.call_id).map(|entry| entry.context)
-        } else {
-            None
-        }
+            .remove(&token.call_id())
+            .ok_or(CallManagerError::UnknownCall)?;
+        let _ = handle.request_shutdown();
+        handle.join().map_err(CallManagerError::Thread)
     }
 
-    /// Stops new admission while existing calls drain.
+    /// Joins every terminal call and returns the number reaped.
+    ///
+    /// # Errors
+    ///
+    /// Preserves native join failure after removing the affected entry.
+    pub fn reap_finished(&mut self) -> Result<usize, CallManagerError> {
+        let mut completed = Vec::new();
+        completed
+            .try_reserve(self.calls.len())
+            .map_err(|_| CallManagerError::AllocationFailed)?;
+        completed.extend(
+            self.calls
+                .iter()
+                .filter_map(|(id, handle)| handle.status().phase.is_terminal().then_some(*id)),
+        );
+        let mut reaped = 0;
+        for id in completed {
+            let handle = self
+                .calls
+                .remove(&id)
+                .ok_or(CallManagerError::UnknownCall)?;
+            handle.join().map_err(CallManagerError::Thread)?;
+            reaped += 1;
+        }
+        Ok(reaped)
+    }
+
+    /// Stops admission, requests every call to drain, clears the registry, and
+    /// joins all native call threads.
+    ///
+    /// # Errors
+    ///
+    /// Preserves native join failure after all calls have been signaled.
+    pub fn shutdown_all(&mut self) -> Result<Vec<CallExit>, CallManagerError> {
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(self.calls.len())
+            .map_err(|_| CallManagerError::AllocationFailed)?;
+        let mut exits = Vec::new();
+        exits
+            .try_reserve_exact(self.calls.len())
+            .map_err(|_| CallManagerError::AllocationFailed)?;
+        self.accepting = false;
+        for handle in self.calls.values() {
+            let _ = handle.request_shutdown();
+        }
+        handles.extend(self.calls.drain().map(|(_, handle)| handle));
+        let mut first_error = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(exit) => exits.push(exit),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(CallManagerError::Thread(error));
+        }
+        Ok(exits)
+    }
+
+    /// Stops new call admission while existing owner threads continue.
     pub const fn begin_shutdown(&mut self) {
         self.accepting = false;
     }
 
-    /// Returns active call count.
+    /// Returns active registered call count.
     #[must_use]
     pub fn len(&self) -> usize {
         self.calls.len()
     }
 
-    /// Returns whether no calls remain.
+    /// Returns whether no call handles remain.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.calls.is_empty()
     }
 
-    fn entry_mut(&mut self, token: CallToken) -> Result<&mut Entry, CallManagerError> {
-        let entry = self
+    fn entry(&self, token: CallToken) -> Result<&CallHandle, CallManagerError> {
+        self.verify(token)?;
+        self.calls
+            .get(&token.call_id())
+            .ok_or(CallManagerError::UnknownCall)
+    }
+
+    fn verify(&self, token: CallToken) -> Result<(), CallManagerError> {
+        let handle = self
             .calls
-            .get_mut(&token.call_id)
+            .get(&token.call_id())
             .ok_or(CallManagerError::UnknownCall)?;
-        if entry.generation != token.generation {
+        if handle.token().generation() != token.generation() {
             return Err(CallManagerError::StaleToken);
         }
-        Ok(entry)
+        Ok(())
     }
 }
 
 impl fmt::Debug for CallManager {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let terminal = self
+            .calls
+            .values()
+            .filter(|handle| handle.status().phase.is_terminal())
+            .count();
         formatter
             .debug_struct("CallManager")
             .field("capacity", &self.capacity)
             .field("active_calls", &self.calls.len())
+            .field("terminal_calls", &terminal)
             .field("accepting", &self.accepting)
             .finish_non_exhaustive()
     }
 }
 
-/// Call registry failure.
-#[derive(Debug)]
+/// Call registry, mailbox, spawn, or join failure.
 pub enum CallManagerError {
     /// Capacity setting was unsafe.
     InvalidCapacity,
-    /// Registry allocation failed.
+    /// Registry/output allocation failed.
     AllocationFailed,
-    /// Registry stopped new admissions.
+    /// Registry stopped new admission.
     ShuttingDown,
-    /// Call ID already active.
+    /// Call ID is already active.
     DuplicateCall,
-    /// Active call limit reached.
+    /// Active call capacity was reached.
     AtCapacity,
     /// Generation counter cannot safely continue.
     GenerationExhausted,
-    /// No actor has this call ID.
+    /// No active handle has this call ID.
     UnknownCall,
-    /// Token belongs to an older actor generation.
+    /// Token belongs to an older native call generation.
     StaleToken,
-    /// Actor mailbox was full.
+    /// Bounded inbound mailbox rejected an event.
     MailboxFull,
-    /// Actor processing failed.
-    Context(CallContextError),
+    /// Native call/action channel is closed.
+    CallClosed,
+    /// Native thread configuration, spawn, or join failed.
+    Thread(CallThreadError),
+}
+
+impl fmt::Debug for CallManagerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CallManagerError")
+            .field("class", &self.class())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CallManagerError {
+    /// Returns stable low-cardinality diagnostics.
+    #[must_use]
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::InvalidCapacity => "invalid-capacity",
+            Self::AllocationFailed => "allocation-failed",
+            Self::ShuttingDown => "shutting-down",
+            Self::DuplicateCall => "duplicate-call",
+            Self::AtCapacity => "at-capacity",
+            Self::GenerationExhausted => "generation-exhausted",
+            Self::UnknownCall => "unknown-call",
+            Self::StaleToken => "stale-token",
+            Self::MailboxFull => "mailbox-full",
+            Self::CallClosed => "call-closed",
+            Self::Thread(_) => "thread",
+        }
+    }
 }
 
 impl fmt::Display for CallManagerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("call manager operation failed")
+        write!(formatter, "call manager error: {}", self.class())
     }
 }
 
 impl StdError for CallManagerError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Context(error) => Some(error),
+            Self::Thread(source) => Some(source),
             _ => None,
         }
     }
@@ -255,46 +393,115 @@ mod tests {
 
     use super::{CallManager, CallManagerError};
     use crate::call::context::CallContext;
-    use crate::call::events::{CallCommand, CallEvent};
+    use crate::call::events::{CallAction, CallCommand, CallEvent};
+    use crate::call::handle::CallThreadPhase;
+    use crate::call::runtime::{
+        CallRuntime, CallRuntimeConfig, DEFAULT_CALL_DEADLINE_CAPACITY,
+        DEFAULT_CALL_DIALOG_CAPACITY, DEFAULT_CALL_TRANSACTION_CAPACITY,
+    };
+    use crate::runtime::admission::AdmissionLeaseGroup;
 
-    fn context() -> CallContext {
-        CallContext::new(Duration::ZERO, 4, 4).unwrap_or_else(|_| panic!("context"))
+    fn runtime() -> CallRuntime {
+        let context = CallContext::new(Duration::ZERO, 32).unwrap_or_else(|_| panic!("context"));
+        let config = CallRuntimeConfig::new(
+            DEFAULT_CALL_TRANSACTION_CAPACITY,
+            DEFAULT_CALL_DIALOG_CAPACITY,
+            DEFAULT_CALL_DEADLINE_CAPACITY,
+            Duration::from_millis(1),
+            false,
+        );
+        CallRuntime::new(context, AdmissionLeaseGroup::new(), config)
+            .unwrap_or_else(|_| panic!("runtime"))
     }
 
     #[test]
     fn stale_token_cannot_reach_reused_call_id() {
         let mut manager = CallManager::new(1).unwrap_or_else(|_| panic!("manager"));
         let first = manager
-            .insert(7, context())
-            .unwrap_or_else(|_| panic!("insert"));
-        assert!(manager.remove(first).is_some());
+            .spawn(7, runtime())
+            .unwrap_or_else(|_| panic!("spawn"));
+        assert!(manager.remove(first).is_ok());
         let second = manager
-            .insert(7, context())
-            .unwrap_or_else(|_| panic!("insert"));
+            .spawn(7, runtime())
+            .unwrap_or_else(|_| panic!("spawn"));
         assert_ne!(first.generation(), second.generation());
         assert!(matches!(
             manager.submit(first, CallEvent::Command(CallCommand::Start)),
-            Err(CallManagerError::StaleToken)
+            Err(CallManagerError::StaleToken | CallManagerError::UnknownCall)
         ));
         assert!(
             manager
                 .submit(second, CallEvent::Command(CallCommand::Start))
                 .is_ok()
         );
+        let actions = manager
+            .receive_actions(second, Duration::from_secs(1))
+            .unwrap_or_else(|_| panic!("actions"));
+        assert_eq!(actions, Some(vec![CallAction::SendInvite]));
+        assert!(manager.remove(second).is_ok());
     }
 
     #[test]
     fn admission_and_shutdown_are_bounded() {
         let mut manager = CallManager::new(1).unwrap_or_else(|_| panic!("manager"));
-        assert!(manager.insert(1, context()).is_ok());
+        let token = manager
+            .spawn(1, runtime())
+            .unwrap_or_else(|_| panic!("spawn"));
         assert!(matches!(
-            manager.insert(2, context()),
+            manager.spawn(2, runtime()),
             Err(CallManagerError::AtCapacity)
         ));
         manager.begin_shutdown();
         assert!(matches!(
-            manager.insert(2, context()),
+            manager.spawn(2, runtime()),
             Err(CallManagerError::ShuttingDown)
         ));
+        assert!(manager.remove(token).is_ok());
+    }
+
+    #[test]
+    fn shutdown_all_signals_then_joins_every_thread() {
+        let mut manager = CallManager::new(4).unwrap_or_else(|_| panic!("manager"));
+        for id in 1..=4 {
+            manager
+                .spawn(id, runtime())
+                .unwrap_or_else(|_| panic!("spawn"));
+        }
+        let exits = manager
+            .shutdown_all()
+            .unwrap_or_else(|_| panic!("shutdown"));
+        assert_eq!(exits.len(), 4);
+        assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn remote_bye_releases_thread_without_other_call_failure() {
+        let mut manager = CallManager::new(2).unwrap_or_else(|_| panic!("manager"));
+        let first = manager
+            .spawn(1, runtime())
+            .unwrap_or_else(|_| panic!("first"));
+        let second = manager
+            .spawn(2, runtime())
+            .unwrap_or_else(|_| panic!("second"));
+        assert!(
+            manager
+                .submit(first, CallEvent::Command(CallCommand::Start))
+                .is_ok()
+        );
+        assert!(manager.submit(first, CallEvent::RemoteBye).is_ok());
+        let _ = manager.receive_actions(first, Duration::from_secs(1));
+        let _ = manager.receive_actions(first, Duration::from_secs(1));
+        for _ in 0..1_000 {
+            if manager
+                .handle(first)
+                .is_ok_and(|handle| handle.status().phase == CallThreadPhase::Completed)
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(manager.handle(second).is_ok());
+        assert!(manager.remove(first).is_ok());
+        assert!(manager.remove(second).is_ok());
     }
 }

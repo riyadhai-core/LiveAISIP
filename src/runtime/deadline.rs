@@ -209,6 +209,19 @@ impl DeadlineScheduler {
         }
     }
 
+    /// Returns the earliest active absolute deadline.
+    ///
+    /// Canceled heap tombstones are removed before the value is returned.
+    pub fn next_deadline(&mut self) -> Option<Duration> {
+        loop {
+            let entry = self.heap.peek()?;
+            if self.active.contains(&entry.0.id) {
+                return Some(entry.0.at);
+            }
+            self.heap.pop();
+        }
+    }
+
     /// Returns active deadline count, excluding canceled heap tombstones.
     #[must_use]
     pub fn len(&self) -> usize {

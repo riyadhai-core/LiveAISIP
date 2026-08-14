@@ -27,6 +27,8 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
+use crate::net::address::{Endpoint, EndpointError};
+
 /// Maximum accepted DNS certificate identity length.
 pub const MAX_TLS_DNS_NAME_BYTES: usize = 253;
 
@@ -133,7 +135,7 @@ impl fmt::Debug for TlsIdentity {
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct Destination {
     protocol: Protocol,
-    remote: SocketAddr,
+    remote: Endpoint,
     tls_identity: Option<TlsIdentity>,
 }
 
@@ -162,7 +164,7 @@ impl Destination {
     ///
     /// Rejects port zero and unspecified addresses.
     pub fn tls(remote: SocketAddr, identity: TlsIdentity) -> Result<Self, DestinationError> {
-        validate_remote(remote)?;
+        let remote = validate_remote(remote)?;
         Ok(Self {
             protocol: Protocol::Tls,
             remote,
@@ -171,7 +173,7 @@ impl Destination {
     }
 
     fn plain(protocol: Protocol, remote: SocketAddr) -> Result<Self, DestinationError> {
-        validate_remote(remote)?;
+        let remote = validate_remote(remote)?;
         Ok(Self {
             protocol,
             remote,
@@ -188,7 +190,7 @@ impl Destination {
     /// Returns the resolved remote endpoint.
     #[must_use]
     pub const fn remote(&self) -> SocketAddr {
-        self.remote
+        self.remote.socket_addr()
     }
 
     /// Returns the TLS identity when required.
@@ -203,27 +205,17 @@ impl fmt::Debug for Destination {
         formatter
             .debug_struct("Destination")
             .field("protocol", &self.protocol)
-            .field(
-                "family",
-                &if self.remote.is_ipv4() {
-                    "ipv4"
-                } else {
-                    "ipv6"
-                },
-            )
+            .field("family", &self.remote.family().as_str())
             .field("tls_identity", &self.tls_identity.is_some())
             .finish_non_exhaustive()
     }
 }
 
-fn validate_remote(remote: SocketAddr) -> Result<(), DestinationError> {
-    if remote.port() == 0 {
-        return Err(DestinationError::ZeroPort);
-    }
-    if remote.ip().is_unspecified() {
-        return Err(DestinationError::UnspecifiedAddress);
-    }
-    Ok(())
+fn validate_remote(remote: SocketAddr) -> Result<Endpoint, DestinationError> {
+    Endpoint::new(remote).map_err(|error| match error {
+        EndpointError::ZeroPort => DestinationError::ZeroPort,
+        EndpointError::UnspecifiedAddress => DestinationError::UnspecifiedAddress,
+    })
 }
 
 fn validate_dns(name: &str) -> Result<(), DestinationError> {

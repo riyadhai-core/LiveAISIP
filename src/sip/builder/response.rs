@@ -37,6 +37,7 @@ use crate::sip::headers::to::ToHeader;
 use crate::sip::headers::via::Via;
 use crate::sip::serializer::message::{self, SerializeError};
 use crate::sip::types::header::{Header, HeaderKind, HeaderValue, HeaderValueError};
+use crate::sip::types::response::Response;
 use crate::sip::types::status::StatusCode;
 use crate::sip::types::version::Version;
 
@@ -165,6 +166,20 @@ impl ResponseBuilder {
     #[must_use]
     pub fn body(&self) -> &[u8] {
         &self.body
+    }
+
+    /// Finishes construction as an immutable canonical response.
+    ///
+    /// Existing reason-phrase, header, and body storage is moved without
+    /// copying or allocating.
+    #[must_use]
+    pub fn build(self) -> Response {
+        Response::from_builder_parts(
+            self.status,
+            self.reason_phrase,
+            self.headers.into_vec(),
+            self.body,
+        )
     }
 
     /// Serializes the response with authoritative `Content-Length`.

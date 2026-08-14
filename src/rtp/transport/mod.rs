@@ -27,7 +27,8 @@ pub mod udp;
 pub use allocator::{PortAllocationError, PortAllocator, PortLease, PortPair, PortPool};
 pub use socket::{
     Component, ConfigureOperation, DEFAULT_MAX_MEDIA_DATAGRAM_BYTES, DatagramBuffer,
-    InboundDatagram, MAX_MEDIA_DATAGRAM_BYTES, MediaSocketPair, SocketConfig, SocketError,
+    InboundDatagram, MAX_MEDIA_DATAGRAM_BYTES, MediaPacketScratch, MediaSocketPair, SocketConfig,
+    SocketError,
 };
 pub use symmetric::{
     DEFAULT_INITIAL_LATCH_PACKETS, DEFAULT_PORT_REBIND_PACKETS, SourceRejection, SymmetricConfig,
