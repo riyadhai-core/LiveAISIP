@@ -187,14 +187,34 @@ impl TransportManager {
             .map_err(ManagerError::Connection)
     }
 
+    /// Removes the oldest queued message for socket-layer ownership.
+    ///
+    /// The message is already admitted and immutable. Returning `None` means
+    /// the known connection currently has no queued work.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown connection identity.
+    pub fn pop_front(&mut self, id: ConnectionId) -> Result<Option<Arc<[u8]>>, ManagerError> {
+        Ok(self.connection_mut(id)?.pop_front())
+    }
+
+    /// Removes one registration and returns its state and unsent queue.
+    ///
+    /// Both destination and identity indexes are cleared atomically from the
+    /// actor's perspective. The returned connection is terminal.
+    pub fn take(&mut self, id: ConnectionId) -> Option<Connection> {
+        let mut connection = self.connections.remove(&id)?;
+        self.destinations.remove(connection.destination());
+        if connection.state() != ConnectionState::Closed {
+            let _ = connection.transition(ConnectionState::Closed);
+        }
+        Some(connection)
+    }
+
     /// Removes and closes one registration, returning whether it existed.
     pub fn remove(&mut self, id: ConnectionId) -> bool {
-        let Some(mut connection) = self.connections.remove(&id) else {
-            return false;
-        };
-        self.destinations.remove(connection.destination());
-        let _ = connection.transition(ConnectionState::Closed);
-        true
+        self.take(id).is_some()
     }
 
     /// Permanently fences new work and begins deterministic connection drain.
@@ -211,6 +231,10 @@ impl TransportManager {
                 ConnectionState::Draining | ConnectionState::Closed => {}
             }
         }
+        self.connections
+            .retain(|_, connection| connection.state() != ConnectionState::Closed);
+        self.destinations
+            .retain(|_, id| self.connections.contains_key(id));
     }
 
     /// Returns a connection by identity.

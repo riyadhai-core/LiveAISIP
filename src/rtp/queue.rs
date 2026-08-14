@@ -146,8 +146,17 @@ impl<T> BoundedQueue<T> {
 
     /// Clears pending items without resetting lifetime diagnostics.
     pub fn clear(&mut self) -> usize {
+        self.clear_with(drop)
+    }
+
+    /// Clears pending items and returns each owned item to its backing pool.
+    ///
+    /// The callback runs synchronously and this method performs no allocation.
+    pub fn clear_with(&mut self, mut release: impl FnMut(T)) -> usize {
         let removed = self.items.len();
-        self.items.clear();
+        while let Some(item) = self.items.pop_front() {
+            release(item);
+        }
         self.drops = self
             .drops
             .saturating_add(u64::try_from(removed).unwrap_or(u64::MAX));
@@ -248,6 +257,27 @@ mod tests {
         assert_eq!(queue.push(1), PushOutcome::Accepted);
         assert_eq!(queue.push(2), PushOutcome::Accepted);
         assert_eq!(queue.clear(), 2);
+        assert_eq!(queue.diagnostics().drops, 2);
+    }
+
+    #[test]
+    fn clear_with_returns_every_owned_item_without_allocation() {
+        let Ok(mut queue) = BoundedQueue::new(4, OverflowPolicy::DropNewest) else {
+            panic!("queue")
+        };
+        assert_eq!(queue.push(1), PushOutcome::Accepted);
+        assert_eq!(queue.push(2), PushOutcome::Accepted);
+        let mut released = [0_u8; 2];
+        let mut index = 0;
+        assert_eq!(
+            queue.clear_with(|item| {
+                released[index] = item;
+                index += 1;
+            }),
+            2
+        );
+        assert_eq!(released, [1, 2]);
+        assert_eq!(queue.diagnostics().depth, 0);
         assert_eq!(queue.diagnostics().drops, 2);
     }
 }

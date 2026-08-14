@@ -22,11 +22,8 @@
 //! Peer certificate and destination-identity verification are mandatory and
 //! cannot be disabled through this API. Only TLS 1.2 and TLS 1.3 are modeled.
 //! Handshake time, certificate-chain bytes, and certificate count are bounded
-//! before a future cryptographic backend is allowed to consume resources.
-//!
-//! This module deliberately does not implement cryptography. A later backend
-//! adapter must prove successful certificate, identity, and protocol checks
-//! before transitioning a handshake to established state.
+//! before the cryptographic backend exposes an established flow. The concrete
+//! verified Rustls integration lives in [`super::tls_driver`].
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -86,7 +83,7 @@ impl TlsPolicy {
         max_certificates: usize,
     ) -> Result<Self, TlsError> {
         if handshake_timeout.is_zero()
-            || handshake_timeout.as_secs() > MAX_HANDSHAKE_TIMEOUT.as_secs()
+            || handshake_timeout.as_nanos() > MAX_HANDSHAKE_TIMEOUT.as_nanos()
         {
             return Err(TlsError::InvalidHandshakeTimeout);
         }
@@ -374,6 +371,15 @@ mod tests {
     fn validates_policy_and_chain_boundaries() {
         assert!(TlsPolicy::with_limits(TlsVersion::Tls13, Duration::from_secs(5), 1024, 2).is_ok());
         assert!(TlsPolicy::with_limits(TlsVersion::Tls12, Duration::ZERO, 1024, 2).is_err());
+        assert!(
+            TlsPolicy::with_limits(
+                TlsVersion::Tls12,
+                Duration::from_secs(60) + Duration::from_nanos(1),
+                1024,
+                2,
+            )
+            .is_err()
+        );
         let handshake = handshake();
         assert!(handshake.admit_peer_chain(1, 1).is_ok());
         assert!(matches!(

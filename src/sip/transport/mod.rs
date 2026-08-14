@@ -28,11 +28,39 @@ pub mod connection;
 /// Bounded SIP-over-UDP datagram preparation.
 pub mod udp;
 
+/// Runtime-neutral SIP-over-UDP socket driver.
+pub mod udp_driver;
+
+/// Validated messages shared by datagram and stream socket drivers.
+pub use udp_driver::{InboundMessage, ReceivedMessage};
+
 /// Incremental bounded SIP-over-TCP stream decoding.
 pub mod tcp;
 
+/// Runtime-neutral SIP-over-TCP socket driver.
+pub mod tcp_driver;
+
 /// TLS security policy and handshake lifecycle.
 pub mod tls;
+
+/// Verified outbound SIP-over-TLS socket driver.
+pub mod tls_driver;
+
+/// Commit-aware bounded signaling transport orchestration.
+pub mod service;
+
+/// Native one-thread readiness reactor for bounded transport orchestration.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub mod reactor;
 
 /// Bounded actor-owned reliable connection registry.
 pub mod manager;

@@ -32,9 +32,13 @@ default = []
 
 [dependencies]
 md-5 = "0.10"
+libc = "0.2.189"
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.4"
 sha2 = "0.10"
 
 [dev-dependencies]
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
 
 [profile.dev]
 opt-level = 0

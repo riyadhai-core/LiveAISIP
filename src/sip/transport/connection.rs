@@ -239,6 +239,15 @@ impl Connection {
         Some(message)
     }
 
+    /// Consumes closed/retired state into its still-unsent messages.
+    ///
+    /// No payload bytes are copied. This is used by the transport owner to
+    /// notify every affected transaction when a reliable flow fails.
+    #[must_use]
+    pub fn into_queued_messages(self) -> VecDeque<Arc<[u8]>> {
+        self.queue
+    }
+
     /// Returns the identity.
     #[must_use]
     pub const fn id(&self) -> ConnectionId {

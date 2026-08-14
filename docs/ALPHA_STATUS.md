@@ -47,6 +47,7 @@ mutate transaction, dialog, call, or media state directly.
 | Independent transport/dialog/media health | Implemented | `src/runtime/signaling.rs` |
 | Transaction-owned automatic 100 Trying | Implemented | `src/sip/transaction/server.rs` |
 | UDP size policy and TCP/TLS fallback | Implemented | `src/sip/transport/selection.rs` |
+| Real SIP UDP socket send/receive, framing and validation | Implemented | `src/sip/transport/udp_driver.rs` |
 | Bounded NAPTR/SRV/address failover planning | Implemented | `src/sip/transport/resolver.rs` |
 | Hostile TCP/TLS stream bounds/deadlines | Implemented | `src/sip/transport/stream.rs` |
 | 503, Retry-After, admission, retry suppression | Implemented | `src/runtime/admission.rs` |
@@ -62,6 +63,7 @@ mutate transaction, dialog, call, or media state directly.
 | SDP-negotiated telephone-event routing outside NetEq | Implemented | `src/sip/sdp/negotiation.rs`, `src/rtp/session.rs` |
 | Constant-memory delayed-loss observability | Implemented | `src/rtp/stats/reorder.rs` |
 | Permanent per-call packet scratch buffers | Implemented | `src/rtp/transport/socket.rs` |
+| Preallocated allocation-free `NetEq` ingress slots | Implemented | `src/rtp/session.rs` |
 | Grouped RAII admission permits | Implemented | `src/runtime/admission.rs` |
 | Privacy-safe bounded call timeline | Implemented | `src/observability/diagnostics.rs` |
 | Graceful admission fence/drain/force shutdown | Implemented | `src/runtime/shutdown.rs` |
@@ -94,8 +96,8 @@ classification, and media security.
 
 - Actual asynchronous DNS queries and TTL cache feeding the bounded resolver
   policy.
-- Rust socket workers connecting deterministic transport actions to UDP,
-  TCP, TLS, SRTP, and SRTCP implementations.
+- Reliable TCP/TLS socket workers and media SRTP/SRTCP integration. The SIP
+  UDP socket boundary is implemented.
 - Native libwebrtc NetEq, resampler, and APM implementation behind the reserved
   media boundaries.
 - The exact 24 kHz mono PCM pointer/handle bridge and Protobuf control bridge.
