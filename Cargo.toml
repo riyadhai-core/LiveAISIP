@@ -1,0 +1,62 @@
+# Copyright 2026 RiyadhAI LLC
+# Licensed under the Apache License, Version 2.0.
+
+[package]
+name = "liveaisip"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "High-performance SIP server for LiveAISIP."
+readme = "README.md"
+
+keywords = [
+    "sip",
+    "rtp",
+    "rtcp",
+    "telephony",
+    "voip",
+]
+
+categories = [
+    "network-programming",
+    "multimedia",
+]
+
+[lib]
+name = "liveaisip"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+md-5 = "0.10"
+sha2 = "0.10"
+
+[dev-dependencies]
+
+[profile.dev]
+opt-level = 0
+debug = true
+overflow-checks = true
+incremental = true
+
+[profile.test]
+opt-level = 1
+debug = true
+overflow-checks = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+strip = "symbols"
+overflow-checks = true
+incremental = false
+
+[profile.bench]
+inherits = "release"
+debug = true
+strip = "none"

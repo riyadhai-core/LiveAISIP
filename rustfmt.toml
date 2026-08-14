@@ -1,0 +1,9 @@
+# Copyright 2026 RiyadhAI LLC
+# Licensed under the Apache License, Version 2.0.
+
+edition = "2024"
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"
+use_small_heuristics = "Default"

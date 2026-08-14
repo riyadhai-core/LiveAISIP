@@ -1,0 +1,75 @@
+# Rust build output
+/target/
+
+# Rust temporary and backup files
+**/*.rs.bk
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Local-only configuration
+*.local
+
+# Native/C++ generated build output
+/build/
+/out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Native object and library files
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.pdb
+
+# Coverage and profiling
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+coverage/
+coverage-*/
+lcov.info
+
+# Benchmarks
+criterion/
+
+# Fuzzing artifacts
+fuzz/artifacts/
+fuzz/corpus/
+
+# Logs and crash dumps
+*.log
+logs/
+core
+core.*
+*.dmp
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp
+.cache/

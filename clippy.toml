@@ -1,0 +1,7 @@
+# Copyright 2026 RiyadhAI LLC
+# Licensed under the Apache License, Version 2.0.
+
+msrv = "1.91.0"
+
+too-many-arguments-threshold = 8
+type-complexity-threshold = 300
