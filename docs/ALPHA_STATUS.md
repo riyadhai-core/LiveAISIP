@@ -29,7 +29,7 @@ described as production-ready elsewhere.
 
 | Capability | Types/parser | State machine | Wire executor | Automated scenario | Real interop | Load/soak |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Outbound UDP INVITE/ACK/BYE | yes | yes | yes | yes | no | no |
+| Outbound UDP INVITE/ACK/local BYE | yes | yes | yes | yes | yes (FreeSWITCH 1.11.2, direct UDP) | no |
 | 401/407 Digest retry | yes | yes | yes | yes | no | no |
 | CANCEL and final-response races | yes | yes | yes | partial | no | no |
 | Dialog Contact/Record-Route routing | yes | yes | yes | yes | no | no |
@@ -90,5 +90,17 @@ classification, and media security.
   pinned Sonora resampling/APM integration.
 - The exact 24 kHz mono PCM pointer/handle bridge and Protobuf control bridge.
 - OpenAI Realtime and the LiveKit-style Python SDK surface.
-- Carrier and FreeSWITCH interoperability, impairment, soak, fuzz, and load
-  qualification required before production release.
+- Remote-BYE interoperability, carrier interoperability, impairment, soak,
+  fuzz, and load qualification required before production release.
+
+## Recorded direct interoperability
+
+The outbound signaling path has completed a direct UDP call against
+FreeSWITCH 1.11.2 (`release-31326320293-3f13ad1b1d`) on its external SIP
+profile. The observed call reached `ACTIVE`, negotiated PCMU, remained up for
+the configured duration, and was cleared by a LiveAISIP-originated BYE.
+
+This evidence covers direct initial INVITE, provisional/final response
+handling, ACK, dialog duration, and local BYE only. It does not establish
+remote-BYE handling, proxied routing, authenticated interoperability, live RTP,
+carrier interoperability, load, or soak readiness.

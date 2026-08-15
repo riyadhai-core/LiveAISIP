@@ -22,7 +22,10 @@ use std::time::{Duration, Instant};
 
 use liveaisip::call::CallAction;
 use liveaisip::call::execution::thread::CallThreadConfig;
-use liveaisip::runtime::{OutboundDialConfig, RuntimeEngine, RuntimeEngineConfig};
+use liveaisip::runtime::{
+    OutboundDialConfig, RuntimeCallSnapshot, RuntimeEngineConfig, RuntimeNotificationKind,
+    RuntimeService, RuntimeServiceConfig,
+};
 use liveaisip::sip::auth::DigestCredentials;
 use liveaisip::sip::headers::retry_after::RetryAfter;
 use liveaisip::sip::parser::uri;
@@ -72,14 +75,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             password.as_str(),
         )?);
     }
-    let mut engine = RuntimeEngine::new(RuntimeEngineConfig::new(
-        1,
-        RetryAfter::new(3),
-        CallThreadConfig::default(),
-        Duration::from_secs(5),
+    let mut service = RuntimeService::new(RuntimeServiceConfig::new(
+        RuntimeEngineConfig::new(
+            1,
+            RetryAfter::new(3),
+            CallThreadConfig::default(),
+            Duration::from_secs(5),
+        ),
+        256,
     ))?;
-    let dialed = engine.dial(1, dial, Duration::ZERO)?;
-    let token = dialed.token();
+    let dialed = service.dial(1, dial, Duration::ZERO)?;
     let bound = dialed.local_addr();
     let advertised = dialed.advertised_addr();
 
@@ -91,14 +96,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut established: Option<Instant> = None;
     let mut hangup_sent = false;
     loop {
-        let handle = engine.handle(token)?;
-        let status = handle.status();
-        if status.phase.is_terminal() {
+        let _ = service.pump()?;
+        if matches!(service.snapshot(1), Some(RuntimeCallSnapshot::Terminal(_))) {
             break;
         }
-        if established.is_none() && started.elapsed() >= config.setup_timeout {
+        if established.is_none() && !hangup_sent && started.elapsed() >= config.setup_timeout {
             eprintln!("setup timeout; cancelling call");
-            engine.hangup(token)?;
+            service.hangup(1)?;
             hangup_sent = true;
         }
         if let Some(at) = established
@@ -106,37 +110,31 @@ fn run() -> Result<(), Box<dyn Error>> {
             && at.elapsed() >= config.duration
         {
             println!("call duration elapsed; sending BYE");
-            engine.hangup(token)?;
+            service.hangup(1)?;
             hangup_sent = true;
         }
 
-        match engine.receive_actions(token, Duration::from_millis(100)) {
-            Ok(Some(actions)) => {
-                for action in actions {
-                    if config.verbose {
-                        println!("call action: {action:?}");
-                    }
-                    if matches!(action, CallAction::SelectBranch { .. }) && established.is_none() {
-                        println!("dialog confirmed; ACK sent");
-                        established = Some(Instant::now());
-                    }
-                    if let CallAction::Ended(reason) = action {
-                        println!("call ended: {reason:?}");
-                    }
-                }
+        while let Some(notification) = service.next_notification() {
+            if config.verbose {
+                println!("runtime notification: {notification:?}");
             }
-            Ok(None) => {}
-            Err(error) => {
-                let latest = engine.handle(token)?.status();
-                if latest.phase.is_terminal() {
-                    break;
+            if let RuntimeNotificationKind::Action(action) = notification.kind() {
+                if matches!(action, CallAction::SelectBranch { .. }) && established.is_none() {
+                    println!("dialog confirmed; ACK sent");
+                    established = Some(Instant::now());
                 }
-                return Err(Box::new(error));
+                if let CallAction::Ended(reason) = action {
+                    println!("call ended: {reason:?}");
+                }
             }
         }
+        std::thread::sleep(Duration::from_millis(10));
     }
 
-    let exit = engine.remove(token)?;
+    let outcome = service
+        .take_terminal_outcome(1)
+        .ok_or_else(|| input_error("terminal call outcome was not retained"))?;
+    let exit = outcome.exit();
     let diagnostics = exit.runtime();
     println!(
         "call thread exited {:?}; final SIP status={:?}, messages={}, deadlines={}, reflexive_endpoint_observed={}, advertised_endpoint_mismatch={}",

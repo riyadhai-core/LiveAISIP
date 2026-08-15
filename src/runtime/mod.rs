@@ -25,10 +25,20 @@ pub mod admission;
 pub mod dial;
 /// Bounded process-level call engine.
 pub mod engine;
+/// Typed bounded outbound media offers.
+pub mod media_offer;
+/// Bounded application-facing runtime service.
+pub mod service;
 /// Coordinated graceful shutdown.
 pub mod shutdown;
 
 pub use dial::{OutboundDialConfig, OutboundDialError, PreparedOutboundCall};
 pub use engine::{
     DialedCall, RuntimeEngine, RuntimeEngineConfig, RuntimeEngineError, RuntimeShutdownProgress,
+};
+pub use media_offer::{MediaCodec, MediaOfferConfig, MediaOfferError};
+pub use service::{
+    NotificationQueueSnapshot, RuntimeCallSnapshot, RuntimeNotification, RuntimeNotificationKind,
+    RuntimePumpReport, RuntimeService, RuntimeServiceConfig, RuntimeServiceError,
+    ServiceShutdownProgress, TerminalOutcome,
 };

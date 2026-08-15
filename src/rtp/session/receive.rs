@@ -20,7 +20,7 @@
 //! RTP receive-stream admission and reporting state.
 //!
 //! This module is the stateful boundary after SRTP decryption and RTP parsing,
-//! but before a packet is admitted to `NetEQ`. It binds negotiated payload type
+//! but before a packet is admitted to playout. It binds negotiated payload type
 //! and SSRC, applies RFC sequence validation, updates jitter/loss counters, and
 //! produces bounded RTCP reception reports.
 
@@ -111,7 +111,7 @@ pub enum ReceivePacketOutcome {
         /// Detailed sequence-validator result.
         disposition: SequenceDisposition,
     },
-    /// Packet is admitted for delivery to `NetEQ`.
+    /// Packet is admitted for delivery to the playout engine.
     Admitted {
         /// Detailed sequence-validator result.
         disposition: SequenceDisposition,
@@ -146,7 +146,7 @@ impl AuxiliaryPacketOutcome {
 }
 
 impl ReceivePacketOutcome {
-    /// Returns whether payload may be forwarded to `NetEQ`.
+    /// Returns whether payload may be forwarded to playout.
     #[must_use]
     pub const fn admitted(self) -> bool {
         matches!(self, Self::Admitted { .. })
@@ -238,7 +238,7 @@ impl RtpReceiveState {
     ///
     /// A stream without a signaling-provided SSRC binds to the first packet
     /// that has the negotiated payload type. Isolated large sequence jumps and
-    /// probation packets are not admitted to `NetEQ`.
+    /// probation packets are not admitted to playout.
     ///
     /// # Errors
     ///
@@ -366,7 +366,7 @@ impl RtpReceiveState {
         &self.jitter
     }
 
-    /// Returns packets admitted to `NetEQ`.
+    /// Returns packets admitted to playout.
     #[must_use]
     pub const fn admitted_packets(&self) -> u64 {
         self.admitted_packets

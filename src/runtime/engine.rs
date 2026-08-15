@@ -29,7 +29,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::call::execution::handle::{CallHandle, CallToken};
-use crate::call::execution::manager::{CallManager, CallManagerError};
+use crate::call::execution::manager::{CallManager, CallManagerError, ManagedCallExit};
 use crate::call::execution::thread::{CallExit, CallThreadConfig};
 use crate::call::model::events::{CallAction, CallCommand, CallEvent};
 use crate::runtime::admission::{
@@ -238,7 +238,7 @@ impl RuntimeEngine {
     /// # Errors
     ///
     /// Preserves registry allocation and native join failure.
-    pub fn reap_finished_reports(&mut self) -> Result<Vec<CallExit>, RuntimeEngineError> {
+    pub fn reap_finished_reports(&mut self) -> Result<Vec<ManagedCallExit>, RuntimeEngineError> {
         self.calls
             .reap_finished_reports()
             .map_err(RuntimeEngineError::Calls)
@@ -296,10 +296,22 @@ impl RuntimeEngine {
         })
     }
 
-    /// Returns registered call count, including terminal calls not yet reaped.
+    /// Returns calls whose dedicated owner thread is not terminal.
     #[must_use]
     pub fn active_calls(&self) -> usize {
+        self.calls.active_len()
+    }
+
+    /// Returns every registered call, including terminal calls not yet reaped.
+    #[must_use]
+    pub fn registered_calls(&self) -> usize {
         self.calls.len()
+    }
+
+    /// Returns terminal call threads that have not yet been reaped.
+    #[must_use]
+    pub fn terminal_unreaped_calls(&self) -> usize {
+        self.calls.terminal_len()
     }
 
     /// Returns currently held active-call admission leases.
@@ -320,6 +332,8 @@ impl fmt::Debug for RuntimeEngine {
         formatter
             .debug_struct("RuntimeEngine")
             .field("registered_calls", &self.calls.len())
+            .field("active_calls", &self.calls.active_len())
+            .field("terminal_unreaped_calls", &self.calls.terminal_len())
             .field("admitted_calls", &self.admission.active())
             .field("shutdown_phase", &self.shutdown.phase())
             .finish_non_exhaustive()
@@ -378,8 +392,8 @@ impl fmt::Debug for DialedCall {
 /// Result of one process-shutdown poll.
 pub struct RuntimeShutdownProgress {
     action: ShutdownAction,
-    completed: Vec<CallExit>,
-    forced: Vec<CallExit>,
+    completed: Vec<ManagedCallExit>,
+    forced: Vec<ManagedCallExit>,
 }
 
 impl RuntimeShutdownProgress {
@@ -397,19 +411,19 @@ impl RuntimeShutdownProgress {
 
     /// Returns terminal reports for calls that completed naturally this poll.
     #[must_use]
-    pub fn completed_exits(&self) -> &[CallExit] {
+    pub fn completed_exits(&self) -> &[ManagedCallExit] {
         &self.completed
     }
 
     /// Returns terminal reports for calls forcibly drained at the deadline.
     #[must_use]
-    pub fn forced_exits(&self) -> &[CallExit] {
+    pub fn forced_exits(&self) -> &[ManagedCallExit] {
         &self.forced
     }
 
     /// Consumes the progress report into forced terminal call reports.
     #[must_use]
-    pub fn into_forced_exits(self) -> Vec<CallExit> {
+    pub fn into_forced_exits(self) -> Vec<ManagedCallExit> {
         self.forced
     }
 }

@@ -17,7 +17,7 @@
 //! A high-performance SIP server developed by `RiyadhAI LLC` for large-scale
 //! realtime AI telephony workloads.
 
-//! Preallocated encoded-packet storage at the `NetEQ` ingress boundary.
+//! Preallocated encoded-packet storage at the playout ingress boundary.
 
 use std::fmt;
 
@@ -25,14 +25,16 @@ use crate::rtp::packet::rtp::{MAX_RTP_PACKET_BYTES, RtpPacket};
 
 use super::RtpSessionError;
 
-/// Default packets waiting for immediate `NetEq` insertion.
+/// Default packets waiting for immediate playout-engine insertion.
 pub const DEFAULT_INGRESS_QUEUE_PACKETS: usize = 128;
-/// Default encoded payload storage reserved for every `NetEq` ingress slot.
-pub const DEFAULT_NETEQ_PAYLOAD_BYTES: usize = 2_048;
+/// Conservative encoded payload storage for codecs without a negotiated bound.
+pub const DEFAULT_PLAYOUT_PAYLOAD_BYTES: usize = 2_048;
+/// Exact payload bytes for one 20 ms PCMU packet.
+pub const PCMU_20MS_PAYLOAD_BYTES: usize = 160;
 /// Hard per-session byte ceiling for preallocated encoded packet slots.
-pub const MAX_NETEQ_PACKET_POOL_BYTES: usize = 4 * 1_024 * 1_024;
+pub const MAX_PLAYOUT_PACKET_POOL_BYTES: usize = 4 * 1_024 * 1_024;
 
-struct NetEqPacketSlot {
+struct PlayoutPacketSlot {
     sequence_number: u16,
     timestamp: u32,
     ssrc: u32,
@@ -42,14 +44,14 @@ struct NetEqPacketSlot {
     occupied: bool,
 }
 
-pub(super) struct NetEqPacketPool {
-    slots: Vec<NetEqPacketSlot>,
+pub(super) struct PlayoutPacketPool {
+    slots: Vec<PlayoutPacketSlot>,
     payloads: Box<[u8]>,
     free: Vec<usize>,
     maximum_payload_bytes: usize,
 }
 
-impl NetEqPacketPool {
+impl PlayoutPacketPool {
     pub(super) fn new(
         queue_capacity: usize,
         maximum_payload_bytes: usize,
@@ -66,10 +68,10 @@ impl NetEqPacketPool {
         let pool_bytes = slot_count
             .checked_mul(maximum_payload_bytes)
             .ok_or(RtpSessionError::AllocationFailed)?;
-        if pool_bytes > MAX_NETEQ_PACKET_POOL_BYTES {
+        if pool_bytes > MAX_PLAYOUT_PACKET_POOL_BYTES {
             return Err(RtpSessionError::PacketPoolTooLarge {
                 requested: pool_bytes,
-                maximum: MAX_NETEQ_PACKET_POOL_BYTES,
+                maximum: MAX_PLAYOUT_PACKET_POOL_BYTES,
             });
         }
         let mut slots = Vec::new();
@@ -77,7 +79,7 @@ impl NetEqPacketPool {
             .try_reserve_exact(slot_count)
             .map_err(|_| RtpSessionError::AllocationFailed)?;
         for _ in 0..slot_count {
-            slots.push(NetEqPacketSlot {
+            slots.push(PlayoutPacketSlot {
                 sequence_number: 0,
                 timestamp: 0,
                 ssrc: 0,
@@ -145,26 +147,34 @@ impl NetEqPacketPool {
         self.free.push(index);
     }
 
-    pub(super) fn packet(&mut self, index: usize) -> Option<NetEqPacket<'_>> {
+    pub(super) fn packet(&mut self, index: usize) -> Option<PlayoutPacket<'_>> {
         self.slots
             .get(index)
             .is_some_and(|slot| slot.occupied)
-            .then_some(NetEqPacket { pool: self, index })
+            .then_some(PlayoutPacket { pool: self, index })
+    }
+
+    pub(super) const fn maximum_payload_bytes(&self) -> usize {
+        self.maximum_payload_bytes
+    }
+
+    pub(super) const fn preallocated_payload_bytes(&self) -> usize {
+        self.payloads.len()
     }
 }
 
-/// Borrowed checkout of one preallocated packet slot admitted for `NetEq`.
+/// Borrowed checkout of one preallocated packet admitted for playout.
 ///
 /// Dropping this value immediately returns its storage to the owning session.
 /// Keeping it alive deliberately keeps the session mutably borrowed, so the
-/// receive loop cannot overwrite the payload before `NetEq::InsertPacket`.
-pub struct NetEqPacket<'a> {
-    pool: &'a mut NetEqPacketPool,
+/// receive loop cannot overwrite the payload before playout insertion.
+pub struct PlayoutPacket<'a> {
+    pool: &'a mut PlayoutPacketPool,
     index: usize,
 }
 
-impl NetEqPacket<'_> {
-    fn slot(&self) -> &NetEqPacketSlot {
+impl PlayoutPacket<'_> {
+    fn slot(&self) -> &PlayoutPacketSlot {
         &self.pool.slots[self.index]
     }
 
@@ -207,17 +217,17 @@ impl NetEqPacket<'_> {
     }
 }
 
-impl Drop for NetEqPacket<'_> {
+impl Drop for PlayoutPacket<'_> {
     fn drop(&mut self) {
         self.pool.release(self.index);
     }
 }
 
-impl fmt::Debug for NetEqPacket<'_> {
+impl fmt::Debug for PlayoutPacket<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let slot = self.slot();
         formatter
-            .debug_struct("NetEqPacket")
+            .debug_struct("PlayoutPacket")
             .field("payload_type", &slot.payload_type)
             .field("marker", &slot.marker)
             .field("payload_bytes", &slot.payload_length)

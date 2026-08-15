@@ -60,7 +60,7 @@ pub enum MediaShutdownAction {
     SendRtcpBye,
     /// Stop the deterministic ten-millisecond media clock.
     StopMediaClock,
-    /// Close `NetEq`, resampler and APM state.
+    /// Close playout, resampler and APM state.
     CloseDsp,
     /// Destroy SRTP/SRTCP contexts.
     DestroySecurityContexts,

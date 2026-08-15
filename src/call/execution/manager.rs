@@ -32,6 +32,27 @@ use crate::util::id::IdGenerator;
 /// Maximum calls configurable in one registry.
 pub const MAX_CALL_MANAGER_CAPACITY: usize = 1_000_000;
 
+/// Generation-fenced identity paired with one terminal call-thread report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagedCallExit {
+    token: CallToken,
+    exit: CallExit,
+}
+
+impl ManagedCallExit {
+    /// Returns the exact call generation that produced this report.
+    #[must_use]
+    pub const fn token(self) -> CallToken {
+        self.token
+    }
+
+    /// Returns privacy-safe terminal call diagnostics.
+    #[must_use]
+    pub const fn exit(self) -> CallExit {
+        self.exit
+    }
+}
+
 /// Handle-only active call registry.
 pub struct CallManager {
     calls: HashMap<u64, CallHandle>,
@@ -219,7 +240,7 @@ impl CallManager {
     ///
     /// Preserves registry/output allocation and native join failures after
     /// removing the affected call.
-    pub fn reap_finished_reports(&mut self) -> Result<Vec<CallExit>, CallManagerError> {
+    pub fn reap_finished_reports(&mut self) -> Result<Vec<ManagedCallExit>, CallManagerError> {
         let mut completed = Vec::new();
         completed
             .try_reserve(self.calls.len())
@@ -238,7 +259,9 @@ impl CallManager {
                 .calls
                 .remove(&id)
                 .ok_or(CallManagerError::UnknownCall)?;
-            exits.push(handle.join().map_err(CallManagerError::Thread)?);
+            let token = handle.token();
+            let exit = handle.join().map_err(CallManagerError::Thread)?;
+            exits.push(ManagedCallExit { token, exit });
         }
         Ok(exits)
     }
@@ -249,7 +272,7 @@ impl CallManager {
     /// # Errors
     ///
     /// Preserves native join failure after all calls have been signaled.
-    pub fn shutdown_all(&mut self) -> Result<Vec<CallExit>, CallManagerError> {
+    pub fn shutdown_all(&mut self) -> Result<Vec<ManagedCallExit>, CallManagerError> {
         let mut handles = Vec::new();
         handles
             .try_reserve_exact(self.calls.len())
@@ -265,8 +288,9 @@ impl CallManager {
         handles.extend(self.calls.drain().map(|(_, handle)| handle));
         let mut first_error = None;
         for handle in handles {
+            let token = handle.token();
             match handle.join() {
-                Ok(exit) => exits.push(exit),
+                Ok(exit) => exits.push(ManagedCallExit { token, exit }),
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
             }
@@ -282,10 +306,28 @@ impl CallManager {
         self.accepting = false;
     }
 
-    /// Returns active registered call count.
+    /// Returns every registered call, including terminal calls not yet reaped.
     #[must_use]
     pub fn len(&self) -> usize {
         self.calls.len()
+    }
+
+    /// Returns registered calls whose owner thread is not terminal.
+    #[must_use]
+    pub fn active_len(&self) -> usize {
+        self.calls
+            .values()
+            .filter(|handle| !handle.status().phase.is_terminal())
+            .count()
+    }
+
+    /// Returns terminal calls still retained in the registry.
+    #[must_use]
+    pub fn terminal_len(&self) -> usize {
+        self.calls
+            .values()
+            .filter(|handle| handle.status().phase.is_terminal())
+            .count()
     }
 
     /// Returns whether no call handles remain.
@@ -315,15 +357,12 @@ impl CallManager {
 
 impl fmt::Debug for CallManager {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let terminal = self
-            .calls
-            .values()
-            .filter(|handle| handle.status().phase.is_terminal())
-            .count();
+        let terminal = self.terminal_len();
         formatter
             .debug_struct("CallManager")
             .field("capacity", &self.capacity)
-            .field("active_calls", &self.calls.len())
+            .field("registered_calls", &self.calls.len())
+            .field("active_calls", &self.active_len())
             .field("terminal_calls", &terminal)
             .field("accepting", &self.accepting)
             .finish_non_exhaustive()

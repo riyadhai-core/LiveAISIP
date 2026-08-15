@@ -39,14 +39,14 @@ pub enum RtpIngressOutcome {
     StreamRejected(ReceivePacketOutcome),
     /// Negotiated auxiliary payload failed shared source/sequence admission.
     AuxiliaryRejected(AuxiliaryPacketOutcome),
-    /// Packet entered the bounded `NetEq` queue.
+    /// Packet entered the bounded playout-ingress queue.
     Queued {
         /// Symmetric endpoint observation after stream validation.
         endpoint: SymmetricObservation,
     },
     /// Packet was valid but the full ingress queue dropped it.
     QueueDropped,
-    /// Negotiated telephone-event was parsed outside the audio/NetEq path.
+    /// Negotiated telephone-event was parsed outside the audio playout path.
     TelephoneEvent {
         /// Exact RFC 4733 payload.
         event: TelephoneEvent,

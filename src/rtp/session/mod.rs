@@ -17,7 +17,7 @@
 //! A high-performance SIP server developed by `RiyadhAI LLC` for large-scale
 //! realtime AI telephony workloads.
 
-//! Owned inbound RTP session boundary before `NetEq`.
+//! Owned inbound RTP session boundary before the playout engine.
 
 /// RTP receive-state validation and sequence tracking.
 pub mod receive;
@@ -28,14 +28,14 @@ pub mod send;
 
 mod error;
 mod ingress;
-mod neteq;
+mod playout_ingress;
 mod telephone;
 
 pub use error::RtpSessionError;
 pub use ingress::{RtcpIngressOutcome, RtpIngressOutcome};
-pub use neteq::{
-    DEFAULT_INGRESS_QUEUE_PACKETS, DEFAULT_NETEQ_PAYLOAD_BYTES, MAX_NETEQ_PACKET_POOL_BYTES,
-    NetEqPacket,
+pub use playout_ingress::{
+    DEFAULT_INGRESS_QUEUE_PACKETS, DEFAULT_PLAYOUT_PAYLOAD_BYTES, MAX_PLAYOUT_PACKET_POOL_BYTES,
+    PCMU_20MS_PAYLOAD_BYTES, PlayoutPacket,
 };
 pub use telephone::TelephoneEventConfig;
 
@@ -43,7 +43,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use self::neteq::NetEqPacketPool;
+use self::playout_ingress::PlayoutPacketPool;
 use self::receive::{RtpReceiveConfig, RtpReceiveState};
 use self::rtcp::{RtcpScheduleConfig, RtcpScheduler, ScheduledReport};
 use super::dtmf::TelephoneEvent;
@@ -68,7 +68,7 @@ pub struct RtpSession {
     security: MediaSecurityPolicy,
     liveness: MediaLiveness,
     ingress: BoundedQueue<usize>,
-    packet_pool: NetEqPacketPool,
+    packet_pool: PlayoutPacketPool,
     source_resets: u64,
     rtcp: Option<RtcpScheduler>,
     rtcp_policy: CompoundPolicy,
@@ -97,7 +97,7 @@ impl RtpSession {
             security,
             liveness,
             ingress_capacity,
-            DEFAULT_NETEQ_PAYLOAD_BYTES,
+            default_payload_limit(receive_config),
         )
     }
 
@@ -118,7 +118,7 @@ impl RtpSession {
         let source = RemoteSourceTracker::new(receive_config.expected_ssrc(), source_policy);
         let ingress = BoundedQueue::new(ingress_capacity, OverflowPolicy::DropNewest)
             .map_err(RtpSessionError::Queue)?;
-        let packet_pool = NetEqPacketPool::new(ingress_capacity, maximum_payload_bytes)?;
+        let packet_pool = PlayoutPacketPool::new(ingress_capacity, maximum_payload_bytes)?;
         Ok(Self {
             receive: RtpReceiveState::new(receive_config),
             receive_config,
@@ -351,10 +351,10 @@ impl RtpSession {
             .map_err(RtpSessionError::Rtcp)
     }
 
-    /// Removes the next admitted packet for immediate `NetEq` insertion.
+    /// Removes the next admitted packet for immediate playout insertion.
     ///
     /// The returned checkout borrows this session and returns its slot on drop.
-    pub fn pop_neteq_packet(&mut self) -> Option<NetEqPacket<'_>> {
+    pub fn pop_playout_packet(&mut self) -> Option<PlayoutPacket<'_>> {
         let slot = self.ingress.pop()?;
         self.packet_pool.packet(slot)
     }
@@ -369,6 +369,18 @@ impl RtpSession {
     #[must_use]
     pub fn ingress_diagnostics(&self) -> QueueDiagnostics {
         self.ingress.diagnostics()
+    }
+
+    /// Returns encoded payload capacity reserved for each playout slot.
+    #[must_use]
+    pub const fn playout_payload_capacity(&self) -> usize {
+        self.packet_pool.maximum_payload_bytes()
+    }
+
+    /// Returns total bytes preallocated for encoded playout payloads.
+    #[must_use]
+    pub const fn playout_payload_pool_bytes(&self) -> usize {
+        self.packet_pool.preallocated_payload_bytes()
     }
 
     /// Returns accepted SSRC reset count.
@@ -396,6 +408,14 @@ impl RtpSession {
         self.source_resets = self.source_resets.saturating_add(1);
         self.delayed_loss = DelayedLossTracker::new();
         Ok(())
+    }
+}
+
+const fn default_payload_limit(config: RtpReceiveConfig) -> usize {
+    if config.payload_type() == 0 && config.clock_rate().get() == 8_000 {
+        PCMU_20MS_PAYLOAD_BYTES
+    } else {
+        DEFAULT_PLAYOUT_PAYLOAD_BYTES
     }
 }
 
@@ -507,8 +527,10 @@ mod tests {
     }
 
     #[test]
-    fn admitted_packets_are_bounded_before_neteq() {
+    fn admitted_packets_are_bounded_before_playout() {
         let mut session = session(MediaSecurityPolicy::PlainAllowed);
+        assert_eq!(session.playout_payload_capacity(), 160);
+        assert_eq!(session.playout_payload_pool_bytes(), 320);
         for sequence in 1..=3 {
             let result = session.ingest_rtp(
                 address(20_000),
@@ -519,13 +541,13 @@ mod tests {
             assert!(result.is_ok());
         }
         assert_eq!(session.ingress_diagnostics().depth, 1);
-        assert!(session.pop_neteq_packet().is_some());
-        assert!(session.pop_neteq_packet().is_none());
+        assert!(session.pop_playout_packet().is_some());
+        assert!(session.pop_playout_packet().is_none());
         assert_eq!(session.ingress_diagnostics().underflows, 1);
     }
 
     #[test]
-    fn neteq_packet_slots_are_reused_without_hot_path_allocation() {
+    fn playout_packet_slots_are_reused_without_hot_path_allocation() {
         let mut session = session(MediaSecurityPolicy::PlainAllowed);
         for sequence in 1..=2 {
             assert!(
@@ -539,7 +561,7 @@ mod tests {
                     .is_ok()
             );
         }
-        let Some(first) = session.pop_neteq_packet() else {
+        let Some(first) = session.pop_playout_packet() else {
             panic!("first packet")
         };
         assert_eq!(first.payload(), &[0x55]);
@@ -555,7 +577,7 @@ mod tests {
             ),
             Ok(RtpIngressOutcome::Queued { .. })
         ));
-        let Some(second) = session.pop_neteq_packet() else {
+        let Some(second) = session.pop_playout_packet() else {
             panic!("second packet")
         };
         assert_eq!(second.payload().as_ptr(), payload_pointer);
@@ -625,11 +647,11 @@ mod tests {
     #[test]
     fn packet_pool_rejects_excessive_total_preallocation_before_allocating() {
         assert!(matches!(
-            super::NetEqPacketPool::new(65_536, 2_048),
+            super::PlayoutPacketPool::new(65_536, 2_048),
             Err(super::RtpSessionError::PacketPoolTooLarge { .. })
         ));
         assert!(matches!(
-            super::NetEqPacketPool::new(1, 0),
+            super::PlayoutPacketPool::new(1, 0),
             Err(super::RtpSessionError::InvalidPayloadLimit { .. })
         ));
     }
@@ -649,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_telephone_event_never_enters_neteq_audio_queue() {
+    fn negotiated_telephone_event_never_enters_playout_audio_queue() {
         let mut session = session(MediaSecurityPolicy::PlainAllowed);
         session
             .configure_telephone_event(

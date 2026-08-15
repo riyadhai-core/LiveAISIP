@@ -87,7 +87,7 @@ pub enum SourceObservation {
     },
     /// First remote source completed probation.
     Bound,
-    /// Active source changed; receiver, RTCP, SRTP and `NetEq` state must reset.
+    /// Active source changed; receiver, RTCP, SRTP and playout state must reset.
     Switched,
     /// Source change was not authorized by policy.
     Rejected,
@@ -206,7 +206,7 @@ impl RemoteSourceTracker {
     /// Explicitly authorizes a signaling-controlled source replacement.
     ///
     /// Returns whether active source identity changed. A true result requires
-    /// resetting sequence, jitter, RTCP, SRTP replay and `NetEq` state.
+    /// resetting sequence, jitter, RTCP, SRTP replay and playout state.
     pub fn authorize(&mut self, ssrc: u32) -> bool {
         self.candidate = None;
         if self.active == Some(ssrc) {
