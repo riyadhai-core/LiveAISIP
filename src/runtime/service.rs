@@ -146,7 +146,6 @@ impl RuntimeService {
         &mut self,
         call_id: u64,
         config: OutboundDialConfig,
-        now: Duration,
     ) -> Result<DialedCall, RuntimeServiceError> {
         if self.calls.contains_key(&call_id) || self.terminal.contains_key(&call_id) {
             return Err(RuntimeServiceError::DuplicateCall);
@@ -156,7 +155,7 @@ impl RuntimeService {
         }
         let dialed = self
             .engine
-            .dial(call_id, config, now)
+            .dial(call_id, config)
             .map_err(RuntimeServiceError::Engine)?;
         let token = dialed.token();
         self.calls.insert(
@@ -737,7 +736,7 @@ mod tests {
         let remote = peer.local_addr().unwrap_or_else(|_| panic!("remote"));
         let mut service = service(1, 1);
         let dialed = service
-            .dial(7, dial_config(remote), Duration::ZERO)
+            .dial(7, dial_config(remote))
             .unwrap_or_else(|_| panic!("dial"));
         let mut buffer = [0_u8; 4_096];
         let (length, source) = peer
@@ -783,7 +782,7 @@ mod tests {
         let remote = peer.local_addr().unwrap_or_else(|_| panic!("remote"));
         let mut service = service(1, 8);
         let _ = service
-            .dial(1, dial_config(remote), Duration::ZERO)
+            .dial(1, dial_config(remote))
             .unwrap_or_else(|_| panic!("dial"));
         service
             .begin_shutdown(Duration::ZERO)
@@ -797,7 +796,7 @@ mod tests {
         ));
         assert_eq!(service.retained_outcomes(), 1);
         assert!(matches!(
-            service.dial(2, dial_config(remote), Duration::from_secs(2)),
+            service.dial(2, dial_config(remote)),
             Err(RuntimeServiceError::OutcomeCapacity | RuntimeServiceError::Engine(_))
         ));
         assert!(service.take_terminal_outcome(1).is_some());

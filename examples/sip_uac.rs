@@ -84,7 +84,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         ),
         256,
     ))?;
-    let dialed = service.dial(1, dial, Duration::ZERO)?;
+    let dialed = service.dial(1, dial)?;
     let bound = dialed.local_addr();
     let advertised = dialed.advertised_addr();
 

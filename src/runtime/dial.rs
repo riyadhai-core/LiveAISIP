@@ -36,6 +36,7 @@ use crate::call::signaling::{
 };
 use crate::runtime::admission::AdmissionLeaseGroup;
 use crate::runtime::media_offer::{MediaOfferConfig, MediaOfferError};
+use crate::runtime::media_session::{MediaSessionConfig, MediaSessionError, PreparedMediaSession};
 use crate::sip::auth::DigestCredentials;
 use crate::sip::framing::MAX_BODY_BYTES;
 use crate::sip::identifier::{WireTokenError, generate_wire_token};
@@ -52,6 +53,7 @@ enum InviteBody {
     Offerless,
     Sdp(Box<[u8]>),
     MediaOffer(MediaOfferConfig),
+    MediaSession(MediaSessionConfig),
     InactivePcmu,
 }
 
@@ -169,6 +171,17 @@ impl OutboundDialConfig {
         self
     }
 
+    /// Prepares a call-owned RTP/RTCP socket pair and generates its SDP offer
+    /// atomically during dial construction.
+    ///
+    /// The remote RTP session remains inactive until a validated SDP answer is
+    /// applied by the call signaling/media controller.
+    #[must_use]
+    pub fn with_media_session(mut self, media: MediaSessionConfig) -> Self {
+        self.body = InviteBody::MediaSession(media);
+        self
+    }
+
     /// Generates the inactive PCMU offer used by signaling-only interop tests.
     ///
     /// The media port is the RFC discard port and the direction is inactive;
@@ -210,7 +223,6 @@ impl OutboundDialConfig {
     /// All supplied admission leases unwind on every failure path.
     pub fn prepare(
         self,
-        started_at: Duration,
         admission: AdmissionLeaseGroup,
     ) -> Result<PreparedOutboundCall, OutboundDialError> {
         let mut signaling = UdpSignaling::bind(self.bind, self.destination, self.driver, self.udp)
@@ -228,6 +240,7 @@ impl OutboundDialConfig {
             signaling = signaling.with_credentials(credentials);
         }
 
+        let mut prepared_media: Option<PreparedMediaSession> = None;
         let mut invite = OutboundInviteConfig::new(self.caller, self.target, advertised_addr)
             .map_err(OutboundDialError::Invite)?;
         match self.body {
@@ -238,6 +251,12 @@ impl OutboundDialConfig {
             InviteBody::MediaOffer(offer) => {
                 let body = render_media_offer(offer)?;
                 invite = invite.with_sdp(&body).map_err(OutboundDialError::Invite)?;
+            }
+            InviteBody::MediaSession(config) => {
+                let media = config.prepare().map_err(OutboundDialError::MediaSession)?;
+                let body = render_media_offer(media.offer())?;
+                invite = invite.with_sdp(&body).map_err(OutboundDialError::Invite)?;
+                prepared_media = Some(media);
             }
             InviteBody::InactivePcmu => {
                 let offer = MediaOfferConfig::pcmu(SocketAddr::new(advertised_addr.ip(), 9))?
@@ -250,16 +269,33 @@ impl OutboundDialConfig {
         signaling
             .install_initial_invite(invite.build().map_err(OutboundDialError::Invite)?)
             .map_err(OutboundDialError::Signaling)?;
-        let context = CallContext::new(started_at, self.timeline_capacity)
+        // Every native call thread owns a private monotonic epoch beginning at
+        // zero. Process-worker uptime must never enter this clock domain.
+        let context = CallContext::new(Duration::ZERO, self.timeline_capacity)
             .map_err(OutboundDialError::Context)?;
-        let runtime = CallRuntime::new(context, admission, self.runtime)
+        let mut runtime = CallRuntime::new(context, admission, self.runtime)
             .map_err(OutboundDialError::Runtime)?
             .with_udp_signaling(signaling)
             .map_err(OutboundDialError::Runtime)?;
+        let (local_media_addr, advertised_media_addr) = if let Some(media) = prepared_media {
+            let local = media.local_rtp_addr();
+            let advertised = media.advertised_rtp_addr();
+            let (sockets, scratch, sender) = media.into_runtime_parts();
+            runtime = runtime
+                .with_media_sockets(sockets)
+                .and_then(|runtime| runtime.with_packet_scratch(scratch))
+                .and_then(|runtime| runtime.with_rtp_sender(sender))
+                .map_err(OutboundDialError::Runtime)?;
+            (Some(local), Some(advertised))
+        } else {
+            (None, None)
+        };
         Ok(PreparedOutboundCall {
             runtime,
             local_addr,
             advertised_addr,
+            local_media_addr,
+            advertised_media_addr,
         })
     }
 }
@@ -283,6 +319,8 @@ pub struct PreparedOutboundCall {
     runtime: CallRuntime,
     local_addr: SocketAddr,
     advertised_addr: SocketAddr,
+    local_media_addr: Option<SocketAddr>,
+    advertised_media_addr: Option<SocketAddr>,
 }
 
 impl PreparedOutboundCall {
@@ -296,6 +334,18 @@ impl PreparedOutboundCall {
     #[must_use]
     pub const fn advertised_addr(&self) -> SocketAddr {
         self.advertised_addr
+    }
+
+    /// Returns the bound RTP endpoint when a media session was prepared.
+    #[must_use]
+    pub const fn local_media_addr(&self) -> Option<SocketAddr> {
+        self.local_media_addr
+    }
+
+    /// Returns the RTP endpoint serialized into SDP when media was prepared.
+    #[must_use]
+    pub const fn advertised_media_addr(&self) -> Option<SocketAddr> {
+        self.advertised_media_addr
     }
 
     /// Moves the completely prepared runtime into its dedicated call thread.
@@ -313,6 +363,11 @@ impl fmt::Debug for PreparedOutboundCall {
             .field(
                 "uses_address_translation",
                 &(self.local_addr != self.advertised_addr),
+            )
+            .field("has_media", &self.local_media_addr.is_some())
+            .field(
+                "media_uses_address_translation",
+                &(self.local_media_addr != self.advertised_media_addr),
             )
             .finish_non_exhaustive()
     }
@@ -353,6 +408,8 @@ pub enum OutboundDialError {
     SessionId(ParseIntError),
     /// Typed media offer was invalid or could not be rendered.
     MediaOffer(MediaOfferError),
+    /// Call-owned local RTP/RTCP preparation failed.
+    MediaSession(MediaSessionError),
 }
 
 impl fmt::Display for OutboundDialError {
@@ -371,6 +428,7 @@ impl StdError for OutboundDialError {
             Self::WireToken(error) => Some(error),
             Self::SessionId(error) => Some(error),
             Self::MediaOffer(error) => Some(error),
+            Self::MediaSession(error) => Some(error),
             Self::CallerNotSip
             | Self::TargetNotSip
             | Self::InvalidAdvertisedAddress
@@ -404,6 +462,7 @@ const fn body_kind(body: &InviteBody) -> &'static str {
         InviteBody::Offerless => "offerless",
         InviteBody::Sdp(_) => "sdp",
         InviteBody::MediaOffer(_) => "media-offer",
+        InviteBody::MediaSession(_) => "media-session",
         InviteBody::InactivePcmu => "inactive-pcmu",
     }
 }
@@ -411,11 +470,12 @@ const fn body_kind(body: &InviteBody) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-    use std::time::Duration;
 
     use super::{OutboundDialConfig, OutboundDialError};
+    use crate::rtp::transport::PortPool;
     use crate::runtime::admission::AdmissionLeaseGroup;
     use crate::runtime::media_offer::MediaOfferConfig;
+    use crate::runtime::media_session::MediaSessionConfig;
     use crate::sip::parser::uri;
 
     fn localhost(port: u16) -> SocketAddr {
@@ -437,7 +497,7 @@ mod tests {
         let remote = peer.local_addr().unwrap_or_else(|_| panic!("remote"));
         let prepared = config(remote)
             .with_inactive_pcmu_sdp()
-            .prepare(Duration::ZERO, AdmissionLeaseGroup::new())
+            .prepare(AdmissionLeaseGroup::new())
             .unwrap_or_else(|_| panic!("prepared call"));
         assert_ne!(prepared.local_addr().port(), 0);
         assert_eq!(prepared.local_addr(), prepared.advertised_addr());
@@ -455,7 +515,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("mapped"));
         let prepared = config(remote)
             .with_advertised_addr(mapped)
-            .and_then(|config| config.prepare(Duration::ZERO, AdmissionLeaseGroup::new()))
+            .and_then(|config| config.prepare(AdmissionLeaseGroup::new()))
             .unwrap_or_else(|_| panic!("prepared call"));
         assert_eq!(prepared.advertised_addr(), mapped);
         assert_ne!(prepared.local_addr(), mapped);
@@ -469,6 +529,32 @@ mod tests {
         let debug = format!("{dial:?}");
         assert!(debug.contains("media-offer"));
         assert!(!debug.contains("40000"));
+    }
+
+    #[test]
+    fn prepared_media_resources_follow_the_call_runtime_lifetime() {
+        let peer = UdpSocket::bind(localhost(0)).unwrap_or_else(|_| panic!("peer"));
+        let remote = peer.local_addr().unwrap_or_else(|_| panic!("remote"));
+        for port in (42_000_u16..60_000).step_by(2) {
+            let pool = PortPool::new(port, port).unwrap_or_else(|_| panic!("pool"));
+            let media = MediaSessionConfig::pcmu(pool.clone(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+            let result = config(remote)
+                .with_media_session(media)
+                .prepare(AdmissionLeaseGroup::new());
+            let Ok(prepared) = result else {
+                continue;
+            };
+            let local_media = prepared
+                .local_media_addr()
+                .unwrap_or_else(|| panic!("local media"));
+            assert_eq!(local_media.port(), port);
+            assert_eq!(prepared.advertised_media_addr(), Some(local_media));
+            assert_eq!(pool.in_use(), 1);
+            drop(prepared.into_runtime());
+            assert_eq!(pool.in_use(), 0);
+            return;
+        }
+        panic!("free media pair")
     }
 
     #[test]

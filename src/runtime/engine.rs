@@ -131,7 +131,6 @@ impl RuntimeEngine {
         &mut self,
         call_id: u64,
         config: OutboundDialConfig,
-        now: Duration,
     ) -> Result<DialedCall, RuntimeEngineError> {
         let lease = self
             .admission
@@ -139,11 +138,11 @@ impl RuntimeEngine {
             .map_err(RuntimeEngineError::Overloaded)?;
         let mut leases = AdmissionLeaseGroup::new();
         leases.push(lease).map_err(RuntimeEngineError::Admission)?;
-        let prepared = config
-            .prepare(now, leases)
-            .map_err(RuntimeEngineError::Dial)?;
+        let prepared = config.prepare(leases).map_err(RuntimeEngineError::Dial)?;
         let local_addr = prepared.local_addr();
         let advertised_addr = prepared.advertised_addr();
+        let local_media_addr = prepared.local_media_addr();
+        let advertised_media_addr = prepared.advertised_media_addr();
         let token = self
             .calls
             .spawn(call_id, prepared.into_runtime())
@@ -159,6 +158,8 @@ impl RuntimeEngine {
             token,
             local_addr,
             advertised_addr,
+            local_media_addr,
+            advertised_media_addr,
         })
     }
 
@@ -346,6 +347,8 @@ pub struct DialedCall {
     token: CallToken,
     local_addr: SocketAddr,
     advertised_addr: SocketAddr,
+    local_media_addr: Option<SocketAddr>,
+    advertised_media_addr: Option<SocketAddr>,
 }
 
 impl DialedCall {
@@ -366,6 +369,18 @@ impl DialedCall {
     pub const fn advertised_addr(self) -> SocketAddr {
         self.advertised_addr
     }
+
+    /// Returns the call-owned RTP endpoint when local media was prepared.
+    #[must_use]
+    pub const fn local_media_addr(self) -> Option<SocketAddr> {
+        self.local_media_addr
+    }
+
+    /// Returns the RTP endpoint serialized into SDP when media was prepared.
+    #[must_use]
+    pub const fn advertised_media_addr(self) -> Option<SocketAddr> {
+        self.advertised_media_addr
+    }
 }
 
 impl fmt::Debug for DialedCall {
@@ -384,6 +399,11 @@ impl fmt::Debug for DialedCall {
             .field(
                 "uses_address_translation",
                 &(self.local_addr != self.advertised_addr),
+            )
+            .field("has_media", &self.local_media_addr.is_some())
+            .field(
+                "media_uses_address_translation",
+                &(self.local_media_addr != self.advertised_media_addr),
             )
             .finish_non_exhaustive()
     }
@@ -538,7 +558,7 @@ mod tests {
         let remote = peer.local_addr().unwrap_or_else(|_| panic!("remote"));
         let mut engine = engine(1);
         let token = engine
-            .dial(7, dial_config(remote), Duration::ZERO)
+            .dial(7, dial_config(remote))
             .unwrap_or_else(|_| panic!("dial"))
             .token();
         let mut buffer = [0_u8; 2_048];
@@ -560,11 +580,11 @@ mod tests {
         let remote = peer.local_addr().unwrap_or_else(|_| panic!("remote"));
         let mut engine = engine(1);
         let token = engine
-            .dial(1, dial_config(remote), Duration::ZERO)
+            .dial(1, dial_config(remote))
             .unwrap_or_else(|_| panic!("first dial"))
             .token();
         let error = engine
-            .dial(2, dial_config(remote), Duration::ZERO)
+            .dial(2, dial_config(remote))
             .err()
             .unwrap_or_else(|| panic!("overload"));
         let policy = error.overload().unwrap_or_else(|| panic!("policy"));
@@ -580,14 +600,14 @@ mod tests {
         let remote = peer.local_addr().unwrap_or_else(|_| panic!("remote"));
         let mut engine = engine(2);
         let _token = engine
-            .dial(1, dial_config(remote), Duration::ZERO)
+            .dial(1, dial_config(remote))
             .unwrap_or_else(|_| panic!("dial"));
         engine
             .begin_shutdown(Duration::from_secs(1))
             .unwrap_or_else(|_| panic!("begin shutdown"));
         assert_eq!(engine.shutdown_phase(), ShutdownPhase::Draining);
         assert!(matches!(
-            engine.dial(2, dial_config(remote), Duration::from_secs(2)),
+            engine.dial(2, dial_config(remote)),
             Err(RuntimeEngineError::Overloaded(_))
         ));
         let waiting = engine

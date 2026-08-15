@@ -15,3 +15,9 @@
 //! Call-owned media negotiation and generation control.
 
 pub mod controller;
+/// Transactional negotiated RTP session generation.
+pub mod session;
+
+pub use session::{
+    ActiveRtpSession, MediaSessionActivation, MediaSessionBuildError, MediaSessionPolicy,
+};
