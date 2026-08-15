@@ -36,7 +36,9 @@ use crate::runtime::admission::AdmissionLeaseGroup;
 use crate::runtime::deadline::{DeadlineError, DeadlineId, DeadlineOwner, DeadlineScheduler};
 use crate::runtime::media::MediaController;
 use crate::sip::auth::AuthContext;
-use crate::sip::dialog::{DialogManager, DialogManagerError, PrackTracker, SessionTimer};
+use crate::sip::dialog::{
+    DialogManager, DialogManagerError, PrackTracker, SessionTimer, SessionTimerAction,
+};
 use crate::sip::transaction::manager::{
     ManagerError as TransactionManagerError, TransactionManager,
 };
@@ -333,6 +335,16 @@ impl CallRuntime {
         Ok(self)
     }
 
+    /// Returns whether emitted actions are already executed by an installed
+    /// call-owned signaling driver and therefore form an observational stream.
+    ///
+    /// Without a signaling driver, embedders may still use the action channel
+    /// as the required effect boundary, so delivery remains strict.
+    #[must_use]
+    pub(crate) const fn actions_are_observational(&self) -> bool {
+        self.signaling.is_some()
+    }
+
     /// Claims this runtime for the current native thread exactly once.
     ///
     /// # Errors
@@ -389,6 +401,7 @@ impl CallRuntime {
                         .execute_call_actions(
                             &actions,
                             &mut self.transactions,
+                            &mut self.dialogs,
                             &mut self.deadlines,
                             now,
                         )
@@ -533,6 +546,7 @@ impl CallRuntime {
         let events = signaling
             .poll(
                 &mut self.transactions,
+                &mut self.dialogs,
                 &mut self.deadlines,
                 &mut self.authentication,
                 now,
@@ -545,7 +559,13 @@ impl CallRuntime {
                 .handle(event, now)
                 .map_err(CallRuntimeError::Context)?;
             signaling
-                .execute_call_actions(&produced, &mut self.transactions, &mut self.deadlines, now)
+                .execute_call_actions(
+                    &produced,
+                    &mut self.transactions,
+                    &mut self.dialogs,
+                    &mut self.deadlines,
+                    now,
+                )
                 .map_err(CallRuntimeError::Signaling)?;
             actions.extend(produced);
         }
@@ -644,23 +664,14 @@ impl CallRuntime {
                 continue;
             }
             if due.owner() != DeadlineOwner::Call {
-                continue;
+                return Err(CallRuntimeError::UnsupportedDeadlineOwner(due.owner()));
             }
-            let Some(timer) = CallTimer::from_kind(due.kind()) else {
-                continue;
-            };
-            let event = match timer {
-                CallTimer::NoAnswer | CallTimer::SessionRefresh | CallTimer::Transfer => {
-                    CallEvent::SignalingTimedOut
-                }
-                CallTimer::MediaInactivity => CallEvent::MediaTimedOut,
-                CallTimer::TransportLiveness => CallEvent::TransportFailed,
-            };
-            actions.extend(
-                self.context
-                    .handle(event, now)
-                    .map_err(CallRuntimeError::Context)?,
-            );
+            let timer =
+                CallTimer::from_kind(due.kind()).ok_or(CallRuntimeError::UnknownDeadlineKind {
+                    owner: due.owner(),
+                    kind: due.kind(),
+                })?;
+            self.dispatch_call_deadline(timer, now, &mut actions)?;
             if self.is_finished() {
                 break;
             }
@@ -887,6 +898,50 @@ impl CallRuntime {
         }
     }
 
+    fn dispatch_call_deadline(
+        &mut self,
+        timer: CallTimer,
+        now: Duration,
+        actions: &mut Vec<CallAction>,
+    ) -> Result<(), CallRuntimeError> {
+        let event = match timer {
+            CallTimer::NoAnswer => Some(CallEvent::SignalingTimedOut),
+            CallTimer::MediaInactivity => Some(CallEvent::MediaTimedOut),
+            CallTimer::TransportLiveness => Some(CallEvent::TransportFailed),
+            CallTimer::Transfer => {
+                let transfer = self
+                    .transfer
+                    .as_mut()
+                    .ok_or(CallRuntimeError::TransferUnavailable)?;
+                transfer.expire();
+                None
+            }
+            CallTimer::SessionRefresh => {
+                let timer = self
+                    .session_timer
+                    .as_mut()
+                    .ok_or(CallRuntimeError::SessionTimerUnavailable)?;
+                match timer.action(now) {
+                    SessionTimerAction::Refresh if timer.start_refresh() => {
+                        return Err(CallRuntimeError::SessionRefreshExecutorUnavailable);
+                    }
+                    SessionTimerAction::Expired => Some(CallEvent::SignalingTimedOut),
+                    SessionTimerAction::Refresh | SessionTimerAction::None => {
+                        return Err(CallRuntimeError::PrematureSessionDeadline);
+                    }
+                }
+            }
+        };
+        if let Some(event) = event {
+            actions.extend(
+                self.context
+                    .handle(event, now)
+                    .map_err(CallRuntimeError::Context)?,
+            );
+        }
+        Ok(())
+    }
+
     fn process_media_clock(&mut self, now: Duration) -> Result<(), CallRuntimeError> {
         let Some(next) = self.next_media_deadline else {
             return Ok(());
@@ -963,6 +1018,23 @@ pub enum CallRuntimeError {
     SignalingUnavailable,
     /// Call-owned SIP transport, transaction, or timer execution failed.
     Signaling(SignalingError),
+    /// A due deadline owner had no installed exhaustive executor.
+    UnsupportedDeadlineOwner(DeadlineOwner),
+    /// A due deadline kind was not defined for its owner.
+    UnknownDeadlineKind {
+        /// Deadline owner.
+        owner: DeadlineOwner,
+        /// Unrecognized low-cardinality kind.
+        kind: u16,
+    },
+    /// Session-refresh work was scheduled without negotiated timer state.
+    SessionTimerUnavailable,
+    /// Session refresh became due before its wire executor was installed.
+    SessionRefreshExecutorUnavailable,
+    /// Session timer work was scheduled before the negotiated instant.
+    PrematureSessionDeadline,
+    /// Transfer expiry was scheduled without an active transfer tracker.
+    TransferUnavailable,
 }
 
 impl fmt::Display for CallRuntimeError {
@@ -986,7 +1058,13 @@ impl StdError for CallRuntimeError {
             | Self::ResourcesAlreadyInstalled
             | Self::TimeOverflow
             | Self::MediaResourcesUnavailable
-            | Self::SignalingUnavailable => None,
+            | Self::SignalingUnavailable
+            | Self::UnsupportedDeadlineOwner(_)
+            | Self::UnknownDeadlineKind { .. }
+            | Self::SessionTimerUnavailable
+            | Self::SessionRefreshExecutorUnavailable
+            | Self::PrematureSessionDeadline
+            | Self::TransferUnavailable => None,
         }
     }
 }
@@ -1003,6 +1081,8 @@ mod tests {
     };
     use crate::call::context::CallContext;
     use crate::call::events::{CallAction, CallCommand, CallEvent};
+    use crate::call::timers::CallTimer;
+    use crate::call::transfer::TransferState;
     use crate::rtp::clock::RtpClockRate;
     use crate::rtp::liveness::MediaLiveness;
     use crate::rtp::security::MediaSecurityPolicy;
@@ -1015,6 +1095,8 @@ mod tests {
         SocketConfig,
     };
     use crate::runtime::admission::AdmissionLeaseGroup;
+    use crate::runtime::deadline::DeadlineOwner;
+    use crate::sip::dialog::{Refresher, SessionTimer};
 
     fn runtime() -> CallRuntime {
         let context = CallContext::new(Duration::ZERO, 16).unwrap_or_else(|_| panic!("context"));
@@ -1142,6 +1224,113 @@ mod tests {
             Some(Duration::from_millis(110))
         );
         assert_eq!(MEDIA_TICK_INTERVAL, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn transfer_deadline_fails_only_transfer_state_without_ending_call() {
+        let mut runtime = runtime();
+        runtime
+            .claim_current_thread()
+            .unwrap_or_else(|_| panic!("claim"));
+        assert_eq!(
+            runtime
+                .transfer()
+                .unwrap_or_else(|_| panic!("transfer"))
+                .state(),
+            TransferState::ReferPending
+        );
+        runtime
+            .schedule_call_deadline(CallTimer::Transfer, Duration::from_secs(1), 1)
+            .unwrap_or_else(|_| panic!("schedule"));
+        assert_eq!(
+            runtime
+                .process_due_deadlines(Duration::from_secs(1))
+                .unwrap_or_else(|_| panic!("due")),
+            Vec::new()
+        );
+        assert_eq!(
+            runtime
+                .transfer()
+                .unwrap_or_else(|_| panic!("transfer"))
+                .state(),
+            TransferState::Failed
+        );
+        assert!(!runtime.is_finished());
+    }
+
+    #[test]
+    fn session_refresh_and_expiry_have_distinct_dispositions() {
+        let mut local = runtime();
+        local
+            .claim_current_thread()
+            .unwrap_or_else(|_| panic!("claim local"));
+        local
+            .set_session_timer(Some(
+                SessionTimer::new(100, 90, Refresher::Local, Duration::ZERO)
+                    .unwrap_or_else(|_| panic!("local timer")),
+            ))
+            .unwrap_or_else(|_| panic!("set local"));
+        local
+            .schedule_call_deadline(CallTimer::SessionRefresh, Duration::from_secs(50), 1)
+            .unwrap_or_else(|_| panic!("schedule local"));
+        assert!(matches!(
+            local.process_due_deadlines(Duration::from_secs(50)),
+            Err(CallRuntimeError::SessionRefreshExecutorUnavailable)
+        ));
+        assert!(!local.is_finished());
+
+        let mut remote = runtime();
+        remote
+            .claim_current_thread()
+            .unwrap_or_else(|_| panic!("claim remote"));
+        remote
+            .set_session_timer(Some(
+                SessionTimer::new(100, 90, Refresher::Remote, Duration::ZERO)
+                    .unwrap_or_else(|_| panic!("remote timer")),
+            ))
+            .unwrap_or_else(|_| panic!("set remote"));
+        remote
+            .schedule_call_deadline(CallTimer::SessionRefresh, Duration::from_secs(100), 1)
+            .unwrap_or_else(|_| panic!("schedule remote"));
+        let actions = remote
+            .process_due_deadlines(Duration::from_secs(100))
+            .unwrap_or_else(|_| panic!("expiry"));
+        assert!(matches!(actions.as_slice(), [CallAction::Ended(_)]));
+        assert!(remote.is_finished());
+    }
+
+    #[test]
+    fn unsupported_or_unknown_deadlines_are_never_silently_consumed() {
+        let mut unsupported = runtime();
+        unsupported
+            .claim_current_thread()
+            .unwrap_or_else(|_| panic!("claim"));
+        unsupported
+            .deadlines
+            .schedule(Duration::ZERO, DeadlineOwner::Dialog, 1, 1)
+            .unwrap_or_else(|_| panic!("schedule"));
+        assert!(matches!(
+            unsupported.process_due_deadlines(Duration::ZERO),
+            Err(CallRuntimeError::UnsupportedDeadlineOwner(
+                DeadlineOwner::Dialog
+            ))
+        ));
+
+        let mut unknown = runtime();
+        unknown
+            .claim_current_thread()
+            .unwrap_or_else(|_| panic!("claim"));
+        unknown
+            .deadlines
+            .schedule(Duration::ZERO, DeadlineOwner::Call, 1, u16::MAX)
+            .unwrap_or_else(|_| panic!("schedule"));
+        assert!(matches!(
+            unknown.process_due_deadlines(Duration::ZERO),
+            Err(CallRuntimeError::UnknownDeadlineKind {
+                owner: DeadlineOwner::Call,
+                kind: u16::MAX
+            })
+        ));
     }
 
     #[test]

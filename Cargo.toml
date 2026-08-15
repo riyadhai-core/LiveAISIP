@@ -33,6 +33,7 @@ default = []
 [dependencies]
 md-5 = "0.10"
 libc = "0.2.189"
+ring = "0.17.14"
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.4"
 sha2 = "0.10"

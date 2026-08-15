@@ -35,7 +35,8 @@
 
 use std::error::Error as StdError;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::num::NonZeroU16;
 
 /// Internet protocol address family.
@@ -418,6 +419,102 @@ impl fmt::Display for BindAddressError {
 
 impl StdError for BindAddressError {}
 
+/// Resolves a wildcard outbound UDP bind to the concrete source IP selected by
+/// the operating-system routing table.
+///
+/// Concrete configured addresses pass through unchanged. For a wildcard bind,
+/// this function creates a short-lived connected UDP probe in the destination
+/// family. Connecting a UDP socket does not send a packet; it only asks the
+/// kernel to select the route and source address. The configured port is
+/// preserved, including zero for an ephemeral real socket binding.
+///
+/// This is intentionally an outbound-only operation. A general SIP listener
+/// bound to all interfaces still needs packet-info support to recover the
+/// actual destination address for each received datagram.
+///
+/// # Errors
+///
+/// Rejects a wildcard destination and preserves probe bind, connect, and local
+/// address discovery failures without disclosing either endpoint in display or
+/// debug output.
+pub fn resolve_outbound_udp_bind(
+    configured: SocketAddr,
+    destination: SocketAddr,
+) -> Result<SocketAddr, OutboundBindError> {
+    let configured = canonicalize(configured);
+    if !configured.ip().is_unspecified() {
+        return Ok(configured);
+    }
+    let destination = canonicalize(destination);
+    if destination.ip().is_unspecified() || destination.port() == 0 {
+        return Err(OutboundBindError::InvalidDestination);
+    }
+    let probe_address = SocketAddr::new(AddressFamily::of_socket(destination).unspecified_ip(), 0);
+    let probe = UdpSocket::bind(probe_address).map_err(OutboundBindError::Bind)?;
+    probe
+        .connect(destination)
+        .map_err(OutboundBindError::Connect)?;
+    let selected = probe
+        .local_addr()
+        .map_err(OutboundBindError::LocalAddress)?;
+    if selected.ip().is_unspecified() {
+        return Err(OutboundBindError::UnspecifiedSelection);
+    }
+    Ok(SocketAddr::new(selected.ip(), configured.port()))
+}
+
+/// Failure to select a concrete outbound UDP source address.
+pub enum OutboundBindError {
+    /// The destination was not a concrete nonzero endpoint.
+    InvalidDestination,
+    /// The route-selection probe could not bind.
+    Bind(io::Error),
+    /// The kernel could not select a route to the destination.
+    Connect(io::Error),
+    /// The selected local address could not be queried.
+    LocalAddress(io::Error),
+    /// The kernel unexpectedly retained a wildcard local address.
+    UnspecifiedSelection,
+}
+
+impl OutboundBindError {
+    /// Returns a stable privacy-safe diagnostic class.
+    #[must_use]
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::InvalidDestination => "invalid-destination",
+            Self::Bind(_) => "probe-bind",
+            Self::Connect(_) => "probe-connect",
+            Self::LocalAddress(_) => "probe-local-address",
+            Self::UnspecifiedSelection => "unspecified-selection",
+        }
+    }
+}
+
+impl fmt::Debug for OutboundBindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OutboundBindError")
+            .field("class", &self.class())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for OutboundBindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "outbound UDP bind error: {}", self.class())
+    }
+}
+
+impl StdError for OutboundBindError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Bind(source) | Self::Connect(source) | Self::LocalAddress(source) => Some(source),
+            Self::InvalidDestination | Self::UnspecifiedSelection => None,
+        }
+    }
+}
+
 fn canonicalize(address: SocketAddr) -> SocketAddr {
     match address {
         SocketAddr::V6(value) => match value.ip().to_ipv4_mapped() {
@@ -442,6 +539,7 @@ mod tests {
 
     use super::{
         AddressFamily, BindAddress, BindAddressError, BindHost, BindPort, Endpoint, EndpointError,
+        OutboundBindError, resolve_outbound_udp_bind,
     };
 
     #[test]
@@ -528,5 +626,28 @@ mod tests {
         let error = error.to_string();
         assert!(!error.contains("0.0.0.0"));
         assert!(!error.contains("5060"));
+    }
+
+    #[test]
+    fn wildcard_outbound_bind_selects_a_concrete_route_address() {
+        let selected = resolve_outbound_udp_bind(
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            SocketAddr::from(([127, 0, 0, 1], 5060)),
+        )
+        .unwrap_or_else(|_| panic!("route selection"));
+        assert_eq!(selected.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(selected.port(), 0);
+    }
+
+    #[test]
+    fn outbound_bind_rejects_nonconcrete_destination_privately() {
+        let Err(error) = resolve_outbound_udp_bind(
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            SocketAddr::from(([0, 0, 0, 0], 5060)),
+        ) else {
+            panic!("wildcard destination must fail");
+        };
+        assert!(matches!(error, OutboundBindError::InvalidDestination));
+        assert!(!format!("{error:?}").contains("5060"));
     }
 }

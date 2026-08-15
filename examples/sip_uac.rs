@@ -19,7 +19,7 @@ use std::error::Error;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use liveaisip::call::context::CallContext;
 use liveaisip::call::manager::CallManager;
@@ -38,6 +38,7 @@ use liveaisip::sip::headers::from::FromHeader;
 use liveaisip::sip::headers::max_forwards::MaxForwards;
 use liveaisip::sip::headers::to::ToHeader;
 use liveaisip::sip::headers::via::Via;
+use liveaisip::sip::identifier::generate_wire_token;
 use liveaisip::sip::parser::{message, uri};
 use liveaisip::sip::transport::udp::UdpConfig;
 use liveaisip::sip::transport::udp_driver::UdpDriverConfig;
@@ -81,7 +82,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         None if !bound.ip().is_unspecified() => bound,
         None => {
             return Err(input_error(
-                "--advertise IP is required when --bind uses a wildcard IP",
+                "UDP route selection returned a wildcard address",
             ));
         }
     };
@@ -172,14 +173,15 @@ fn build_invite(
     if !request_uri.is_sip() {
         return Err(input_error("--to must be a sip: or sips: URI"));
     }
-    let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let from =
-        FromHeader::from_bytes(format!("<{}>;tag=liveaisip-{unique:x}", config.from).as_bytes())?;
+    let tag = generate_wire_token()?;
+    let call_token = generate_wire_token()?;
+    let branch = generate_wire_token()?;
+    let from = FromHeader::from_bytes(format!("<{}>;tag={tag}", config.from).as_bytes())?;
     let to = ToHeader::from_bytes(format!("<{}>", config.to).as_bytes())?;
-    let call_id = CallId::new(format!("{unique:x}@{}", advertised.ip()))?;
+    let call_id = CallId::new(format!("{call_token}@{}", advertised.ip()))?;
     let cseq = CSeq::new(1, Method::Invite)?;
     let via =
-        Via::from_bytes(format!("SIP/2.0/UDP {advertised};branch=z9hG4bK-{unique:x}").as_bytes())?;
+        Via::from_bytes(format!("SIP/2.0/UDP {advertised};branch=z9hG4bK-{branch}").as_bytes())?;
     let contact = Contact::from_bytes(format!("<sip:liveaisip@{advertised}>").as_bytes())?;
     let mut builder = RequestBuilder::new(
         Method::Invite,
@@ -193,7 +195,7 @@ fn build_invite(
     )?;
     builder.push_typed(HeaderKind::Contact, &contact)?;
     let address_type = if advertised.is_ipv4() { "IP4" } else { "IP6" };
-    let session_id = u64::try_from(unique).unwrap_or(u64::MAX);
+    let session_id = u64::from_str_radix(&call_token[..16], 16)?;
     let sdp = format!(
         "v=0\r\no=liveaisip {session_id} {session_id} IN {address_type} {}\r\n\
          s=LiveAISIP signaling-only call\r\nc=IN {address_type} {}\r\nt=0 0\r\n\
@@ -274,6 +276,6 @@ fn input_error(message: &str) -> Box<dyn Error> {
 
 fn print_usage() {
     println!(
-        "Usage: cargo run --example sip_uac -- \\\n+         --destination 127.0.0.1:5060 \\\n+         --bind 0.0.0.0:0 --advertise 192.0.2.10 \\\n+         --from sip:liveaisip@192.0.2.10 --to sip:1000@127.0.0.1 \\\n+         [--username USER --password-env ENV] [--duration 5] \\\n+         [--setup-timeout 45] [--verbose]"
+        "Usage: cargo run --example sip_uac -- \\\n  --destination 127.0.0.1:5060 \\\n  --bind 0.0.0.0:0 --advertise 192.0.2.10 \\\n  --from sip:liveaisip@192.0.2.10 --to sip:1000@127.0.0.1 \\\n  [--username USER --password-env ENV] [--duration 5] \\\n  [--setup-timeout 45] [--verbose]"
     );
 }

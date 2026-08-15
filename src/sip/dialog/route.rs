@@ -19,8 +19,8 @@
 
 //! Bounded SIP dialog route sets and request routing plans.
 //!
-//! Route-set establishment is role-sensitive: a UAC preserves `Record-Route`
-//! order from the response, while a UAS reverses the order received in the
+//! Route-set establishment is role-sensitive: a UAC reverses `Record-Route`
+//! order from the response, while a UAS preserves the order received in the
 //! request. Request calculation implements both loose routing (`lr`) and the
 //! legacy strict-routing rewrite without mutating the stored dialog state.
 
@@ -49,29 +49,29 @@ impl RouteSet {
     /// Creates the route set for a locally initiated dialog.
     ///
     /// `routes` must be supplied in the wire order of the response's
-    /// `Record-Route` values.
+    /// `Record-Route` values. They are reversed into local outbound order.
     ///
     /// # Errors
     ///
     /// Returns [`DialogRouteError::TooManyRoutes`] when the operational bound
     /// is exceeded.
-    pub fn for_uac(routes: Vec<Uri>) -> Result<Self, DialogRouteError> {
-        Self::from_ordered(routes)
+    pub fn for_uac(mut routes: Vec<Uri>) -> Result<Self, DialogRouteError> {
+        check_count(routes.len())?;
+        routes.reverse();
+        Ok(Self { routes })
     }
 
     /// Creates the route set for a remotely initiated dialog.
     ///
     /// `routes` must be supplied in the wire order of the request's
-    /// `Record-Route` values. The order is reversed as required for a UAS.
+    /// `Record-Route` values and are preserved for a UAS.
     ///
     /// # Errors
     ///
     /// Returns [`DialogRouteError::TooManyRoutes`] when the operational bound
     /// is exceeded.
-    pub fn for_uas(mut routes: Vec<Uri>) -> Result<Self, DialogRouteError> {
-        check_count(routes.len())?;
-        routes.reverse();
-        Ok(Self { routes })
+    pub fn for_uas(routes: Vec<Uri>) -> Result<Self, DialogRouteError> {
+        Self::from_ordered(routes)
     }
 
     /// Creates a route set already oriented from the local user agent toward
@@ -247,7 +247,7 @@ mod tests {
         let first = uri("sip:proxy-a.example;lr");
         let second = uri("sip:proxy-b.example;lr");
         let target = uri("sip:callee@target.example");
-        let Ok(set) = RouteSet::for_uac(vec![first.clone(), second.clone()]) else {
+        let Ok(set) = RouteSet::from_ordered(vec![first.clone(), second.clone()]) else {
             panic!("bounded route set")
         };
         let plan = set.plan(&target);
@@ -260,7 +260,7 @@ mod tests {
         let strict = uri("sip:strict.example");
         let next = uri("sip:next.example;lr");
         let target = uri("sip:callee@target.example");
-        let Ok(set) = RouteSet::for_uac(vec![strict.clone(), next.clone()]) else {
+        let Ok(set) = RouteSet::from_ordered(vec![strict.clone(), next.clone()]) else {
             panic!("bounded route set")
         };
         let plan = set.plan(&target);
@@ -269,13 +269,17 @@ mod tests {
     }
 
     #[test]
-    fn uas_reverses_record_route_wire_order() {
+    fn role_specific_record_route_order_follows_rfc_3261() {
         let first = uri("sip:first.example;lr");
         let second = uri("sip:second.example;lr");
-        let Ok(set) = RouteSet::for_uas(vec![first.clone(), second.clone()]) else {
+        let Ok(uac) = RouteSet::for_uac(vec![first.clone(), second.clone()]) else {
             panic!("bounded route set")
         };
-        assert_eq!(set.as_slice(), &[second, first]);
+        assert_eq!(uac.as_slice(), &[second.clone(), first.clone()]);
+        let Ok(uas) = RouteSet::for_uas(vec![first.clone(), second.clone()]) else {
+            panic!("bounded route set")
+        };
+        assert_eq!(uas.as_slice(), &[first, second]);
     }
 
     #[test]

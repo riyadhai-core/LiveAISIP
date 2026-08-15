@@ -309,9 +309,7 @@ fn run_call(
     loop {
         let now = clock.now();
         let due = runtime.process_due_deadlines(now).map_err(|_| ())?;
-        if !due.is_empty() {
-            actions.try_send(due).map_err(|_| ())?;
-        }
+        publish_actions(runtime, actions, due)?;
         if runtime.is_finished() {
             return Ok(());
         }
@@ -346,16 +344,26 @@ fn run_call(
         };
         if let Some(message) = message {
             let produced = runtime.handle(message, clock.now()).map_err(|_| ())?;
-            if !produced.is_empty() {
-                actions.try_send(produced).map_err(|_| ())?;
-            }
+            publish_actions(runtime, actions, produced)?;
         } else if !mailbox_open {
             let produced = runtime.begin_shutdown(clock.now()).map_err(|_| ())?;
-            if !produced.is_empty() {
-                actions.try_send(produced).map_err(|_| ())?;
-            }
+            publish_actions(runtime, actions, produced)?;
         }
     }
+}
+
+fn publish_actions(
+    runtime: &CallRuntime,
+    actions: &ActionSender,
+    produced: Vec<super::events::CallAction>,
+) -> Result<(), ()> {
+    if produced.is_empty() {
+        return Ok(());
+    }
+    if actions.try_send(produced).is_err() && !runtime.actions_are_observational() {
+        return Err(());
+    }
+    Ok(())
 }
 
 /// Native call-thread configuration, spawn, or join failure.
@@ -419,21 +427,25 @@ mod tests {
     use std::collections::HashSet;
     use std::io;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Arc;
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
     use super::{CallExitKind, CallThread, CallThreadConfig};
     use crate::call::context::CallContext;
-    use crate::call::events::{CallCommand, CallEvent};
-    use crate::call::handle::{CallHandle, CallThreadPhase, CallToken};
+    use crate::call::events::{CallAction, CallCommand, CallEvent};
+    use crate::call::handle::{ActionSender, CallHandle, CallThreadPhase, CallToken, QueueMetrics};
     use crate::call::leg::DialogBranchId;
     use crate::call::runtime::{
         CallMessage, CallRuntime, CallRuntimeConfig, DEFAULT_CALL_DEADLINE_CAPACITY,
         DEFAULT_CALL_DIALOG_CAPACITY, DEFAULT_CALL_TRANSACTION_CAPACITY,
     };
+    use crate::call::signaling::UdpSignaling;
+    use crate::call::state::CallEndReason;
     use crate::rtp::transport::{MediaSocketPair, PortPool, SocketConfig};
     use crate::runtime::admission::{AdmissionController, AdmissionLeaseGroup};
     use crate::sip::headers::retry_after::RetryAfter;
+    use crate::sip::transport::udp::UdpConfig;
+    use crate::sip::transport::udp_driver::UdpDriverConfig;
 
     fn runtime(admission: AdmissionLeaseGroup) -> CallRuntime {
         let context = CallContext::new(Duration::ZERO, 32).unwrap_or_else(|_| panic!("context"));
@@ -532,6 +544,33 @@ mod tests {
         assert_eq!(healthy.status().phase, CallThreadPhase::Running);
         assert!(healthy.request_shutdown().is_ok());
         assert!(healthy.join().is_ok());
+    }
+
+    #[test]
+    fn full_observer_queue_cannot_fail_runtime_with_internal_signaling() {
+        let peer =
+            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap_or_else(|_| panic!("peer"));
+        let remote = peer.local_addr().unwrap_or_else(|_| panic!("remote"));
+        let signaling = UdpSignaling::bind(
+            std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            remote,
+            UdpDriverConfig::default(),
+            UdpConfig::default(),
+        )
+        .unwrap_or_else(|_| panic!("signaling"));
+        let runtime = runtime(AdmissionLeaseGroup::new())
+            .with_udp_signaling(signaling)
+            .unwrap_or_else(|_| panic!("runtime signaling"));
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let metrics = Arc::new(QueueMetrics::new(1));
+        let actions = ActionSender::new(sender, Arc::clone(&metrics));
+        let batch = || vec![CallAction::Ended(CallEndReason::LocalHangup)];
+
+        assert!(super::publish_actions(&runtime, &actions, batch()).is_ok());
+        assert!(super::publish_actions(&runtime, &actions, batch()).is_ok());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.depth, 1);
+        assert_eq!(snapshot.rejected_full, 1);
     }
 
     #[test]

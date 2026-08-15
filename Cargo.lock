@@ -215,6 +215,7 @@ dependencies = [
  "libc",
  "md-5",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "sha2",

@@ -254,6 +254,68 @@ impl TransactionManager {
         Ok(token)
     }
 
+    /// Starts and registers one server transaction as an atomic owner action.
+    ///
+    /// The initial request is delivered exactly once only after admission and
+    /// map allocation succeed. The returned generation token must fence every
+    /// response and timer action.
+    ///
+    /// # Errors
+    ///
+    /// Rejects shutdown, duplicate keys, capacity/allocation failure, or a
+    /// transaction that had already been started.
+    pub fn start_server(
+        &mut self,
+        mut transaction: ServerTransaction,
+    ) -> Result<RoutedActions<ServerAction>, ManagerError> {
+        self.admit(transaction.key(), Role::Server)?;
+        self.servers
+            .try_reserve(1)
+            .map_err(|_| ManagerError::AllocationFailed)?;
+        let token = self.token(transaction.key().clone(), Role::Server)?;
+        let actions = transaction.start().map_err(ManagerError::Server)?;
+        self.servers.insert(
+            token.key.clone(),
+            Entry {
+                generation: token.generation,
+                transaction,
+            },
+        );
+        Ok(RoutedActions { token, actions })
+    }
+
+    /// Records a serialized response in one exact server transaction.
+    ///
+    /// # Errors
+    ///
+    /// Rejects wrong-role, unknown or stale tokens and illegal server state
+    /// transitions.
+    pub fn respond_server(
+        &mut self,
+        token: &Token,
+        status: crate::sip::types::status::StatusCode,
+        bytes: std::sync::Arc<[u8]>,
+    ) -> Result<RoutedActions<ServerAction>, ManagerError> {
+        if token.role != Role::Server {
+            return Err(ManagerError::WrongRole);
+        }
+        let entry = self
+            .servers
+            .get_mut(&token.key)
+            .ok_or(ManagerError::Unknown)?;
+        if entry.generation != token.generation {
+            return Err(ManagerError::StaleGeneration);
+        }
+        let actions = entry
+            .transaction
+            .send_response(status, bytes)
+            .map_err(ManagerError::Server)?;
+        Ok(RoutedActions {
+            token: token.clone(),
+            actions,
+        })
+    }
+
     /// Routes a validated response to its client transaction.
     ///
     /// The returned token must accompany every emitted timer operation so a

@@ -243,6 +243,18 @@ impl TransferTracker {
     pub const fn notifications(self) -> u16 {
         self.notifications
     }
+
+    /// Expires an unfinished REFER subscription without ending the call.
+    ///
+    /// Returns `true` only when pending state became terminal. Repeated expiry
+    /// after success or failure is idempotent.
+    pub fn expire(&mut self) -> bool {
+        if self.state.is_terminal() {
+            return false;
+        }
+        self.state = TransferState::Failed;
+        true
+    }
 }
 
 impl Default for TransferTracker {
@@ -337,5 +349,13 @@ mod tests {
             .unwrap_or_else(|_| panic!("complete"));
         assert_eq!(complete.state, TransferState::Succeeded);
         assert!(transfer.on_notify(200, true).is_err());
+    }
+
+    #[test]
+    fn timeout_fails_only_an_unfinished_transfer() {
+        let mut transfer = TransferTracker::new();
+        assert!(transfer.expire());
+        assert_eq!(transfer.state(), TransferState::Failed);
+        assert!(!transfer.expire());
     }
 }

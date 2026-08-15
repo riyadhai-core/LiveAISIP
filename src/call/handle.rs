@@ -319,7 +319,7 @@ pub enum CallThreadPhase {
     Running,
     /// Call ended and cleanup completed normally.
     Completed,
-    /// A normal runtime or output-backpressure failure ended the call.
+    /// A normal runtime or required external-effect failure ended the call.
     Failed,
     /// An unexpected Rust panic was contained at the thread boundary.
     Panicked,
@@ -405,6 +405,12 @@ impl CallHandle {
     }
 
     /// Tries to receive one ordered action batch emitted by the owner thread.
+    ///
+    /// For a runtime with call-owned signaling installed, this is a bounded
+    /// best-effort observer stream: protocol effects execute before publication
+    /// and a slow observer may miss batches. Queue metrics expose such drops.
+    /// Without installed signaling, the stream is the strict external effect
+    /// boundary and queue rejection terminates that incomplete call runtime.
     ///
     /// # Errors
     ///

@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91.0
+          components: rustfmt, clippy
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Reject compiler and Clippy warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run every test, example, and benchmark target
+        run: cargo test --all-targets --all-features --locked

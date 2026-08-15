@@ -42,6 +42,12 @@ impl DialogBranchId {
         }
         Ok(Self(value))
     }
+
+    /// Returns the exact case-sensitive remote dialog tag.
+    #[must_use]
+    pub const fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for DialogBranchId {

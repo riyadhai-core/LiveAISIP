@@ -37,6 +37,8 @@ pub mod framing;
 
 /// Typed and extension SIP headers.
 pub mod headers;
+/// Cryptographically strong identifiers serialized onto the SIP wire.
+pub mod identifier;
 
 /// SIP wire-format parsing.
 pub mod parser;

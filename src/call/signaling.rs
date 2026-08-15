@@ -15,55 +15,80 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::net::address::{OutboundBindError, resolve_outbound_udp_bind};
 use crate::runtime::deadline::{DeadlineError, DeadlineId, DeadlineOwner, DeadlineScheduler};
 use crate::sip::auth::{
     AuthChallenge, AuthContext, AuthContextError, AuthScope, ChallengeParseError, DigestCredentials,
 };
 use crate::sip::builder::request::RequestBuilder;
+use crate::sip::builder::response::ResponseBuilder;
+use crate::sip::dialog::route::{DialogRouteError, MAX_DIALOG_ROUTES, RouteSet};
+use crate::sip::dialog::{
+    Dialog, DialogError, DialogId, DialogIdError, DialogManager, DialogManagerError, DialogState,
+};
 use crate::sip::headers::authorization::Authorization;
 use crate::sip::headers::call_id::CallId;
+use crate::sip::headers::contact::Contact;
 use crate::sip::headers::content_type::ContentType;
 use crate::sip::headers::cseq::CSeq;
 use crate::sip::headers::from::FromHeader;
 use crate::sip::headers::max_forwards::MaxForwards;
 use crate::sip::headers::proxy_authorization::ProxyAuthorization;
+use crate::sip::headers::record_route::{RecordRoute, RecordRouteEntry};
+use crate::sip::headers::route::Route;
 use crate::sip::headers::to::ToHeader;
 use crate::sip::headers::via::Via;
+use crate::sip::identifier::{WireTokenError, generate_wire_token};
 use crate::sip::parser::message;
-use crate::sip::transaction::client::{Action, ClientTransaction, Timer};
+use crate::sip::transaction::client::{
+    Action as ClientAction, ClientTransaction, Timer as ClientTimer,
+};
 use crate::sip::transaction::completion::CompletionDisposition;
 use crate::sip::transaction::manager::{
-    ClientResponseRoute, ManagerError, Token, TransactionManager,
+    AckRoute, ClientResponseRoute, ManagerError, ServerRequestRoute, Token, TransactionManager,
+};
+use crate::sip::transaction::server::{
+    Action as ServerAction, ServerTransaction, Timer as ServerTimer,
 };
 use crate::sip::transaction::timer::TimerConfig;
 use crate::sip::transport::destination::Destination;
+use crate::sip::transport::flow::{FlowError, IngressMeta};
 use crate::sip::transport::udp::{OutboundDatagram, UdpConfig, UdpError};
 use crate::sip::transport::udp_driver::{
     InboundMessage, UdpDriver, UdpDriverConfig, UdpDriverError,
 };
+use crate::sip::types::address::Address;
 use crate::sip::types::header::{Header, HeaderKind, HeaderName, HeaderValue};
 use crate::sip::types::method::Method;
+use crate::sip::types::status::StatusCode;
 use crate::sip::types::uri::Uri;
 use crate::sip::validation::headers::{
     LogicalValueError, analyze_logical_value, materialize_logical_value, trim_horizontal_whitespace,
 };
 use crate::sip::validation::request::ValidatedRequest;
 use crate::sip::validation::response::ValidatedResponse;
-use crate::util::id::IdGenerator;
 use crate::util::time::checked_deadline;
 
 use super::events::{CallAction, CallEvent};
-use super::leg::{DialogBranchId, MAX_FORKED_DIALOGS};
+use super::leg::DialogBranchId;
 
 /// Maximum SIP datagrams drained for one call-thread readiness turn.
 pub const MAX_SIGNALING_DATAGRAMS_PER_POLL: usize = 64;
-/// Maximum simultaneously tracked client transaction timers per call.
-pub const MAX_CLIENT_TRANSACTION_TIMERS: usize = 384;
+/// Maximum simultaneously tracked client and server transaction timers per call.
+pub const MAX_TRANSACTION_TIMERS: usize = 384;
 
 struct TimerEntry {
     id: DeadlineId,
     token: Token,
-    timer: Timer,
+    timer: TransactionTimer,
+}
+
+enum TransactionTimer {
+    Client(ClientTimer),
+    Server {
+        timer: ServerTimer,
+        destination: Destination,
+    },
 }
 
 struct RequestTemplate {
@@ -72,16 +97,11 @@ struct RequestTemplate {
     initial_to: ToHeader,
     call_id: CallId,
     invite_sequence: u32,
+    active_invite_via: Via,
     max_forwards: MaxForwards,
     extension_headers: Vec<Header>,
     content_type: Option<ContentType>,
     body: Box<[u8]>,
-}
-
-struct ConfirmedBranch {
-    id: DialogBranchId,
-    to: ToHeader,
-    invite_sequence: u32,
 }
 
 /// One call-owned UDP socket, destination, initial transaction, and timers.
@@ -95,8 +115,6 @@ pub struct UdpSignaling {
     credentials: Option<DigestCredentials>,
     server_authorization: Option<Authorization>,
     proxy_authorization: Option<ProxyAuthorization>,
-    confirmed: Vec<ConfirmedBranch>,
-    identifiers: IdGenerator,
     timers: Vec<TimerEntry>,
     received: u64,
     rejected: u64,
@@ -116,14 +134,12 @@ impl UdpSignaling {
         udp: UdpConfig,
     ) -> Result<Self, SignalingError> {
         let destination = Destination::udp(remote).map_err(SignalingError::Destination)?;
+        let local =
+            resolve_outbound_udp_bind(local, remote).map_err(SignalingError::OutboundBind)?;
         let driver = UdpDriver::bind(local, driver).map_err(SignalingError::Driver)?;
         let mut timers = Vec::new();
         timers
-            .try_reserve_exact(MAX_CLIENT_TRANSACTION_TIMERS)
-            .map_err(|_| SignalingError::AllocationFailed)?;
-        let mut confirmed = Vec::new();
-        confirmed
-            .try_reserve_exact(MAX_FORKED_DIALOGS)
+            .try_reserve_exact(MAX_TRANSACTION_TIMERS)
             .map_err(|_| SignalingError::AllocationFailed)?;
         let advertised_addr = driver.local_addr();
         Ok(Self {
@@ -136,8 +152,6 @@ impl UdpSignaling {
             credentials: None,
             server_authorization: None,
             proxy_authorization: None,
-            confirmed,
-            identifiers: IdGenerator::new(),
             timers,
             received: 0,
             rejected: 0,
@@ -231,6 +245,7 @@ impl UdpSignaling {
             initial_to: core.to_header().clone(),
             call_id: core.call_id().clone(),
             invite_sequence: core.cseq().sequence(),
+            active_invite_via: core.via().clone(),
             max_forwards,
             extension_headers,
             content_type: core.content_type().cloned(),
@@ -261,7 +276,7 @@ impl UdpSignaling {
             .start_client(transaction)
             .map_err(SignalingError::Transactions)?;
         let (token, actions) = routed.into_parts();
-        self.execute_actions(transactions, deadlines, &token, actions, now)?;
+        self.execute_client_actions(transactions, deadlines, &token, actions, now)?;
         Ok(())
     }
 
@@ -274,6 +289,7 @@ impl UdpSignaling {
     pub(crate) fn poll(
         &mut self,
         transactions: &mut TransactionManager,
+        dialogs: &mut DialogManager,
         deadlines: &mut DeadlineScheduler,
         authentication: &mut AuthContext,
         now: Duration,
@@ -292,8 +308,22 @@ impl UdpSignaling {
                 }
             };
             self.received = self.received.saturating_add(1);
+            let ingress = received.ingress();
             let InboundMessage::Response(response) = received.message() else {
-                self.rejected = self.rejected.saturating_add(1);
+                let request = received
+                    .message()
+                    .as_request()
+                    .ok_or(SignalingError::InvalidInboundMessage)?;
+                if let Some(event) = self.handle_inbound_request(
+                    request,
+                    ingress,
+                    transactions,
+                    dialogs,
+                    deadlines,
+                    now,
+                )? {
+                    events.push(event);
+                }
                 continue;
             };
             let route = transactions
@@ -302,7 +332,7 @@ impl UdpSignaling {
             let deliver = match route {
                 ClientResponseRoute::Live(routed) => {
                     let (token, actions) = routed.into_parts();
-                    self.execute_actions(transactions, deadlines, &token, actions, now)?
+                    self.execute_client_actions(transactions, deadlines, &token, actions, now)?
                 }
                 ClientResponseRoute::Retained(CompletionDisposition::ResendFailureAck {
                     ack,
@@ -330,11 +360,7 @@ impl UdpSignaling {
             }
             if deliver && let Some(event) = response_event(response)? {
                 if let CallEvent::InviteAccepted { branch } = &event {
-                    self.remember_confirmed(
-                        branch.clone(),
-                        response.core_headers().to_header(),
-                        response.core_headers().cseq().sequence(),
-                    )?;
+                    self.remember_confirmed(branch, response, dialogs)?;
                 }
                 events.push(event);
             }
@@ -342,26 +368,168 @@ impl UdpSignaling {
         Ok(events)
     }
 
+    fn handle_inbound_request(
+        &mut self,
+        request: &ValidatedRequest,
+        ingress: &IngressMeta,
+        transactions: &mut TransactionManager,
+        dialogs: &mut DialogManager,
+        deadlines: &mut DeadlineScheduler,
+        now: Duration,
+    ) -> Result<Option<CallEvent>, SignalingError> {
+        let destination =
+            Destination::udp(ingress.source()).map_err(SignalingError::Destination)?;
+        if request.request_line().method() == &Method::Ack {
+            return match transactions
+                .route_ack(request)
+                .map_err(SignalingError::Transactions)?
+            {
+                AckRoute::Transaction(routed) => {
+                    let (token, actions) = routed.into_parts();
+                    self.execute_server_actions(
+                        transactions,
+                        deadlines,
+                        &token,
+                        &destination,
+                        actions,
+                        now,
+                    )?;
+                    Ok(None)
+                }
+                AckRoute::Dialog => {
+                    if !Self::in_dialog_request_is_valid(request, false, dialogs) {
+                        self.rejected = self.rejected.saturating_add(1);
+                    }
+                    Ok(None)
+                }
+            };
+        }
+
+        match transactions
+            .route_request(request)
+            .map_err(SignalingError::Transactions)?
+        {
+            ServerRequestRoute::Existing(routed) => {
+                let (token, actions) = routed.into_parts();
+                self.execute_server_actions(
+                    transactions,
+                    deadlines,
+                    &token,
+                    &destination,
+                    actions,
+                    now,
+                )?;
+                Ok(None)
+            }
+            ServerRequestRoute::New => {
+                let transaction = ServerTransaction::new(request, false, TimerConfig::default())
+                    .map_err(SignalingError::Server)?;
+                let (token, actions) = transactions
+                    .start_server(transaction)
+                    .map_err(SignalingError::Transactions)?
+                    .into_parts();
+                let deliver = self.execute_server_actions(
+                    transactions,
+                    deadlines,
+                    &token,
+                    &destination,
+                    actions,
+                    now,
+                )?;
+                if !deliver {
+                    return Ok(None);
+                }
+                let (status, event) = Self::classify_inbound_request(request, dialogs);
+                let response = build_response(request, ingress, status)?;
+                let (response_token, actions) = transactions
+                    .respond_server(&token, status, response)
+                    .map_err(SignalingError::Transactions)?
+                    .into_parts();
+                self.execute_server_actions(
+                    transactions,
+                    deadlines,
+                    &response_token,
+                    &destination,
+                    actions,
+                    now,
+                )?;
+                Ok(event)
+            }
+        }
+    }
+
+    fn classify_inbound_request(
+        request: &ValidatedRequest,
+        dialogs: &mut DialogManager,
+    ) -> (StatusCode, Option<CallEvent>) {
+        match request.request_line().method() {
+            Method::Bye if Self::in_dialog_request_is_valid(request, true, dialogs) => {
+                (StatusCode::OK, Some(CallEvent::RemoteBye))
+            }
+            Method::Bye
+            | Method::Invite
+            | Method::Update
+            | Method::Prack
+            | Method::Info
+            | Method::Refer
+            | Method::Notify
+                if !Self::in_dialog_request_is_valid(request, false, dialogs) =>
+            {
+                (StatusCode::CALL_TRANSACTION_DOES_NOT_EXIST, None)
+            }
+            Method::Options => (StatusCode::OK, None),
+            Method::Cancel => (StatusCode::CALL_TRANSACTION_DOES_NOT_EXIST, None),
+            _ => (StatusCode::NOT_IMPLEMENTED, None),
+        }
+    }
+
+    fn in_dialog_request_is_valid(
+        request: &ValidatedRequest,
+        advance_sequence: bool,
+        dialogs: &mut DialogManager,
+    ) -> bool {
+        let headers = request.core_headers();
+        let (Some(local_tag), Some(remote_tag)) =
+            (headers.to_header().tag(), headers.from_header().tag())
+        else {
+            return false;
+        };
+        let Ok(id) = DialogId::new(headers.call_id().clone(), local_tag, remote_tag) else {
+            return false;
+        };
+        let Some(token) = dialogs.token_for(&id) else {
+            return false;
+        };
+        if !advance_sequence {
+            return dialogs.get(&token).is_ok();
+        }
+        let Ok(dialog) = dialogs.get_mut(&token) else {
+            return false;
+        };
+        dialog.accept_remote_cseq(headers.cseq()).is_ok()
+    }
+
     /// Executes SIP wire effects selected by deterministic call lifecycle.
     pub(crate) fn execute_call_actions(
         &mut self,
         actions: &[CallAction],
         transactions: &mut TransactionManager,
+        dialogs: &mut DialogManager,
         deadlines: &mut DeadlineScheduler,
         now: Duration,
     ) -> Result<(), SignalingError> {
         for action in actions {
             match action {
                 CallAction::SendCancel => {
-                    let request = self.build_request(Method::Cancel, None)?;
+                    let request = self.build_request(Method::Cancel, None, dialogs)?;
                     self.start_request(request, transactions, deadlines, now)?;
                 }
                 CallAction::SendAck { branch } => {
-                    let request = self.build_request(Method::Ack, Some(branch))?;
+                    let request = self.build_request(Method::Ack, Some(branch), dialogs)?;
                     self.send(request.into_message().into_bytes())?;
                 }
                 CallAction::SendBye { branch } => {
-                    let request = self.build_request(Method::Bye, Some(branch))?;
+                    let request = self.build_request(Method::Bye, Some(branch), dialogs)?;
                     self.start_request(request, transactions, deadlines, now)?;
                 }
                 CallAction::SendInvite
@@ -376,7 +544,7 @@ impl UdpSignaling {
         Ok(())
     }
 
-    /// Applies one due generation-fenced client transaction timer.
+    /// Applies one due generation-fenced client or server transaction timer.
     pub(crate) fn on_deadline(
         &mut self,
         id: DeadlineId,
@@ -388,28 +556,46 @@ impl UdpSignaling {
             return Ok(None);
         };
         let entry = self.timers.swap_remove(index);
-        let actions = transactions
-            .client_timer(&entry.token, entry.timer)
-            .map_err(SignalingError::Transactions)?;
-        self.execute_actions(transactions, deadlines, &entry.token, actions, now)?;
-        Ok((entry.timer == Timer::RequestTimeout).then_some(CallEvent::SignalingTimedOut))
+        match entry.timer {
+            TransactionTimer::Client(timer) => {
+                let actions = transactions
+                    .client_timer(&entry.token, timer)
+                    .map_err(SignalingError::Transactions)?;
+                self.execute_client_actions(transactions, deadlines, &entry.token, actions, now)?;
+                Ok((timer == ClientTimer::RequestTimeout).then_some(CallEvent::SignalingTimedOut))
+            }
+            TransactionTimer::Server { timer, destination } => {
+                let actions = transactions
+                    .server_timer(&entry.token, timer)
+                    .map_err(SignalingError::Transactions)?;
+                self.execute_server_actions(
+                    transactions,
+                    deadlines,
+                    &entry.token,
+                    &destination,
+                    actions,
+                    now,
+                )?;
+                Ok(None)
+            }
+        }
     }
 
-    fn execute_actions(
+    fn execute_client_actions(
         &mut self,
         transactions: &mut TransactionManager,
         deadlines: &mut DeadlineScheduler,
         token: &Token,
-        actions: Vec<Action>,
+        actions: Vec<ClientAction>,
         now: Duration,
     ) -> Result<bool, SignalingError> {
         let mut deliver = false;
         for action in actions {
             match action {
-                Action::Send(bytes) | Action::SendAck(bytes) => self.send(bytes)?,
-                Action::Schedule { timer, after } => {
-                    self.cancel_timer(token, timer, deadlines);
-                    if self.timers.len() >= MAX_CLIENT_TRANSACTION_TIMERS {
+                ClientAction::Send(bytes) | ClientAction::SendAck(bytes) => self.send(bytes)?,
+                ClientAction::Schedule { timer, after } => {
+                    self.cancel_client_timer(token, timer, deadlines);
+                    if self.timers.len() >= MAX_TRANSACTION_TIMERS {
                         return Err(SignalingError::TimerCapacity);
                     }
                     let at =
@@ -419,18 +605,72 @@ impl UdpSignaling {
                             at,
                             DeadlineOwner::Transaction,
                             token.generation(),
-                            timer_kind(timer),
+                            client_timer_kind(timer),
                         )
                         .map_err(SignalingError::Deadlines)?;
                     self.timers.push(TimerEntry {
                         id,
                         token: token.clone(),
-                        timer,
+                        timer: TransactionTimer::Client(timer),
                     });
                 }
-                Action::Cancel(timer) => self.cancel_timer(token, timer, deadlines),
-                Action::DeliverResponse => deliver = true,
-                Action::Terminate => {
+                ClientAction::Cancel(timer) => self.cancel_client_timer(token, timer, deadlines),
+                ClientAction::DeliverResponse => deliver = true,
+                ClientAction::Terminate => {
+                    self.cancel_token(token, deadlines);
+                    transactions
+                        .complete_at(token, now)
+                        .map_err(SignalingError::Transactions)?;
+                }
+            }
+        }
+        Ok(deliver)
+    }
+
+    fn execute_server_actions(
+        &mut self,
+        transactions: &mut TransactionManager,
+        deadlines: &mut DeadlineScheduler,
+        token: &Token,
+        destination: &Destination,
+        actions: Vec<ServerAction>,
+        now: Duration,
+    ) -> Result<bool, SignalingError> {
+        let mut deliver = false;
+        for action in actions {
+            match action {
+                ServerAction::DeliverRequest => deliver = true,
+                ServerAction::SendResponse(bytes) => {
+                    self.send_to(destination.clone(), bytes)?;
+                }
+                ServerAction::Schedule { timer, after } => {
+                    self.cancel_server_timer(token, timer, deadlines);
+                    if self.timers.len() >= MAX_TRANSACTION_TIMERS {
+                        return Err(SignalingError::TimerCapacity);
+                    }
+                    let at =
+                        checked_deadline(now, after).map_err(|_| SignalingError::TimeOverflow)?;
+                    let id = deadlines
+                        .schedule(
+                            at,
+                            DeadlineOwner::Transaction,
+                            token.generation(),
+                            server_timer_kind(timer),
+                        )
+                        .map_err(SignalingError::Deadlines)?;
+                    self.timers.push(TimerEntry {
+                        id,
+                        token: token.clone(),
+                        timer: TransactionTimer::Server {
+                            timer,
+                            destination: destination.clone(),
+                        },
+                    });
+                }
+                ServerAction::Cancel(timer) => {
+                    self.cancel_server_timer(token, timer, deadlines);
+                }
+                ServerAction::Terminate => {
                     self.cancel_token(token, deadlines);
                     transactions
                         .complete_at(token, now)
@@ -454,7 +694,7 @@ impl UdpSignaling {
             .start_client(transaction)
             .map_err(SignalingError::Transactions)?
             .into_parts();
-        self.execute_actions(transactions, deadlines, &token, actions, now)?;
+        self.execute_client_actions(transactions, deadlines, &token, actions, now)?;
         Ok(())
     }
 
@@ -462,75 +702,125 @@ impl UdpSignaling {
         &mut self,
         method: Method,
         branch: Option<&DialogBranchId>,
+        dialogs: &mut DialogManager,
     ) -> Result<ValidatedRequest, SignalingError> {
+        let generated_via = if method == Method::Cancel {
+            None
+        } else {
+            Some(self.generate_via()?)
+        };
         let template = self
             .template
             .as_ref()
             .ok_or(SignalingError::InitialInviteMissing)?;
-        let to = match branch {
-            Some(branch) => self
-                .confirmed
-                .iter()
-                .find(|confirmed| &confirmed.id == branch)
-                .map(|confirmed| &confirmed.to)
-                .ok_or(SignalingError::UnknownDialogBranch)?,
-            None => &template.initial_to,
+        let mut to = template.initial_to.clone();
+        let (routing, cseq) = if let Some(branch) = branch {
+            let local_tag = template
+                .from
+                .tag()
+                .ok_or(SignalingError::MissingLocalDialogTag)?;
+            let id = DialogId::new(template.call_id.clone(), local_tag, branch.as_str())
+                .map_err(SignalingError::DialogId)?;
+            let token = dialogs
+                .token_for(&id)
+                .ok_or(SignalingError::UnknownDialogBranch)?;
+            to.set_tag(branch.as_str()).map_err(SignalingError::To)?;
+            let cseq = match method {
+                Method::Ack => {
+                    let dialog = dialogs.get(&token).map_err(SignalingError::Dialogs)?;
+                    CSeq::new(dialog.local_sequence(), Method::Ack).map_err(SignalingError::CSeq)?
+                }
+                _ => dialogs
+                    .get_mut(&token)
+                    .map_err(SignalingError::Dialogs)?
+                    .next_local_cseq(method.clone())
+                    .map_err(SignalingError::Dialog)?,
+            };
+            let routing = dialogs
+                .get(&token)
+                .map_err(SignalingError::Dialogs)?
+                .routing_plan()
+                .map_err(SignalingError::Dialog)?;
+            (Some(routing), cseq)
+        } else {
+            let sequence = template.invite_sequence;
+            let cseq = CSeq::new(sequence, method.clone()).map_err(SignalingError::CSeq)?;
+            (None, cseq)
         };
-        let sequence = match method {
-            Method::Ack => branch
-                .and_then(|id| self.confirmed.iter().find(|entry| &entry.id == id))
-                .map_or(template.invite_sequence, |entry| entry.invite_sequence),
-            Method::Cancel => template.invite_sequence,
-            _ => template
-                .invite_sequence
-                .checked_add(1)
-                .ok_or(SignalingError::SequenceExhausted)?,
-        };
-        let cseq = CSeq::new(sequence, method.clone()).map_err(SignalingError::CSeq)?;
-        let id = self
-            .identifiers
-            .allocate()
-            .map_err(|_| SignalingError::IdentifierExhausted)?;
-        let via_text = format!("SIP/2.0/UDP {};branch=z9hG4bK-{id}", self.advertised_addr);
-        let via = Via::from_bytes(via_text.as_bytes()).map_err(SignalingError::Via)?;
-        let request = RequestBuilder::new(
+        let request_uri = routing
+            .as_ref()
+            .map_or(&template.request_uri, |plan| plan.request_uri());
+        let via = generated_via
+            .as_ref()
+            .unwrap_or(&template.active_invite_via);
+        let mut builder = RequestBuilder::new(
             method,
-            template.request_uri.clone(),
-            &via,
+            request_uri.clone(),
+            via,
             &template.from,
-            to,
+            &to,
             &template.call_id,
             &cseq,
             template.max_forwards,
         )
-        .map_err(SignalingError::Build)?
-        .build()
-        .serialize()
-        .map_err(SignalingError::Serialize)?;
-        let raw =
-            message::parse(Arc::from(request.into_boxed_slice())).map_err(SignalingError::Parse)?;
-        crate::sip::validation::request::validate(raw).map_err(SignalingError::ValidateRequest)
+        .map_err(SignalingError::Build)?;
+        if let Some(routing) = routing.as_ref()
+            && !routing.routes().is_empty()
+        {
+            let route = route_header(routing.routes())?;
+            builder
+                .push_typed(HeaderKind::Route, &route)
+                .map_err(SignalingError::Build)?;
+        }
+        if builder.method() == &Method::Cancel {
+            for header in template
+                .extension_headers
+                .iter()
+                .filter(|header| header.name().kind() == Some(HeaderKind::Route))
+            {
+                builder
+                    .push_header(header.clone())
+                    .map_err(SignalingError::Build)?;
+            }
+        }
+        serialize_and_validate(builder)
     }
 
     fn remember_confirmed(
         &mut self,
-        id: DialogBranchId,
-        to: &ToHeader,
-        invite_sequence: u32,
+        branch: &DialogBranchId,
+        response: &ValidatedResponse,
+        dialogs: &mut DialogManager,
     ) -> Result<(), SignalingError> {
-        if let Some(existing) = self.confirmed.iter_mut().find(|entry| entry.id == id) {
-            existing.to = to.clone();
-            existing.invite_sequence = invite_sequence;
+        let fallback = &self
+            .template
+            .as_ref()
+            .ok_or(SignalingError::InitialInviteMissing)?
+            .request_uri;
+        let (remote_target, route_set) = dialog_routing(response, fallback)?;
+        let invite_sequence = response.core_headers().cseq().sequence();
+        let id = DialogId::from_uac_response(response).map_err(SignalingError::DialogId)?;
+        if id.remote_tag() != branch.as_str() {
+            return Err(SignalingError::DialogBranchMismatch);
+        }
+        if let Some(token) = dialogs.token_for(&id) {
+            let dialog = dialogs.get_mut(&token).map_err(SignalingError::Dialogs)?;
+            dialog.confirm().map_err(SignalingError::Dialog)?;
+            dialog
+                .update_remote_target(remote_target)
+                .map_err(SignalingError::Dialog)?;
             return Ok(());
         }
-        if self.confirmed.len() >= MAX_FORKED_DIALOGS {
-            return Err(SignalingError::DialogBranchCapacity);
-        }
-        self.confirmed.push(ConfirmedBranch {
+        let dialog = Dialog::new(
             id,
-            to: to.clone(),
+            DialogState::Confirmed,
+            route_set,
+            remote_target,
             invite_sequence,
-        });
+            None,
+        )
+        .map_err(SignalingError::Dialog)?;
+        dialogs.insert(dialog).map_err(SignalingError::Dialogs)?;
         Ok(())
     }
 
@@ -566,11 +856,7 @@ impl UdpSignaling {
             .install(scope, &challenges)
             .map_err(SignalingError::Authentication)?;
         let uri = template.request_uri.to_string();
-        let identifier = self
-            .identifiers
-            .allocate()
-            .map_err(|_| SignalingError::IdentifierExhausted)?;
-        let client_nonce = format!("liveaisip-{identifier}");
+        let client_nonce = generate_wire_token().map_err(SignalingError::WireToken)?;
         let digest = authentication
             .authorize(
                 scope,
@@ -599,11 +885,13 @@ impl UdpSignaling {
             .invite_sequence
             .checked_add(1)
             .ok_or(SignalingError::SequenceExhausted)?;
-        let request = self.build_authenticated_invite(sequence)?;
-        self.template
+        let (request, via) = self.build_authenticated_invite(sequence)?;
+        let template = self
+            .template
             .as_mut()
-            .ok_or(SignalingError::InitialInviteMissing)?
-            .invite_sequence = sequence;
+            .ok_or(SignalingError::InitialInviteMissing)?;
+        template.invite_sequence = sequence;
+        template.active_invite_via = via;
         self.start_request(request, transactions, deadlines, now)?;
         Ok(true)
     }
@@ -611,18 +899,13 @@ impl UdpSignaling {
     fn build_authenticated_invite(
         &mut self,
         sequence: u32,
-    ) -> Result<ValidatedRequest, SignalingError> {
+    ) -> Result<(ValidatedRequest, Via), SignalingError> {
+        let via = self.generate_via()?;
         let template = self
             .template
             .as_ref()
             .ok_or(SignalingError::InitialInviteMissing)?;
         let cseq = CSeq::new(sequence, Method::Invite).map_err(SignalingError::CSeq)?;
-        let id = self
-            .identifiers
-            .allocate()
-            .map_err(|_| SignalingError::IdentifierExhausted)?;
-        let via_text = format!("SIP/2.0/UDP {};branch=z9hG4bK-{id}", self.advertised_addr);
-        let via = Via::from_bytes(via_text.as_bytes()).map_err(SignalingError::Via)?;
         let mut builder = RequestBuilder::new(
             Method::Invite,
             template.request_uri.clone(),
@@ -654,12 +937,29 @@ impl UdpSignaling {
                 .with_body(content_type, &template.body)
                 .map_err(SignalingError::Build)?;
         }
-        serialize_and_validate(builder)
+        Ok((serialize_and_validate(builder)?, via))
+    }
+
+    fn generate_via(&mut self) -> Result<Via, SignalingError> {
+        let token = generate_wire_token().map_err(SignalingError::WireToken)?;
+        let via_text = format!(
+            "SIP/2.0/UDP {};branch=z9hG4bK-{token}",
+            self.advertised_addr
+        );
+        Via::from_bytes(via_text.as_bytes()).map_err(SignalingError::Via)
     }
 
     fn send(&mut self, bytes: Arc<[u8]>) -> Result<(), SignalingError> {
-        let datagram = OutboundDatagram::new(self.destination.clone(), bytes, self.udp)
-            .map_err(SignalingError::Udp)?;
+        self.send_to(self.destination.clone(), bytes)
+    }
+
+    fn send_to(
+        &mut self,
+        destination: Destination,
+        bytes: Arc<[u8]>,
+    ) -> Result<(), SignalingError> {
+        let datagram =
+            OutboundDatagram::new(destination, bytes, self.udp).map_err(SignalingError::Udp)?;
         self.driver
             .send(&datagram)
             .map_err(SignalingError::Driver)?;
@@ -667,12 +967,34 @@ impl UdpSignaling {
         Ok(())
     }
 
-    fn cancel_timer(&mut self, token: &Token, timer: Timer, deadlines: &mut DeadlineScheduler) {
-        if let Some(index) = self
-            .timers
-            .iter()
-            .position(|entry| &entry.token == token && entry.timer == timer)
-        {
+    fn cancel_client_timer(
+        &mut self,
+        token: &Token,
+        timer: ClientTimer,
+        deadlines: &mut DeadlineScheduler,
+    ) {
+        if let Some(index) = self.timers.iter().position(|entry| {
+            &entry.token == token
+                && matches!(entry.timer, TransactionTimer::Client(value) if value == timer)
+        }) {
+            let entry = self.timers.swap_remove(index);
+            deadlines.cancel(entry.id);
+        }
+    }
+
+    fn cancel_server_timer(
+        &mut self,
+        token: &Token,
+        timer: ServerTimer,
+        deadlines: &mut DeadlineScheduler,
+    ) {
+        if let Some(index) = self.timers.iter().position(|entry| {
+            &entry.token == token
+                && matches!(
+                    entry.timer,
+                    TransactionTimer::Server { timer: value, .. } if value == timer
+                )
+        }) {
             let entry = self.timers.swap_remove(index);
             deadlines.cancel(entry.id);
         }
@@ -734,6 +1056,117 @@ fn collect_challenges(
     Ok(challenges)
 }
 
+fn dialog_routing(
+    response: &ValidatedResponse,
+    fallback_target: &Uri,
+) -> Result<(Uri, RouteSet), SignalingError> {
+    let mut remote_target = None;
+    let mut routes = Vec::new();
+    for field in response.message().header_views() {
+        let kind = field.kind().copied();
+        if !matches!(kind, Some(HeaderKind::Contact | HeaderKind::RecordRoute)) {
+            continue;
+        }
+        let analysis =
+            analyze_logical_value(field.value()).map_err(SignalingError::HeaderNormalization)?;
+        let logical =
+            materialize_logical_value(analysis).map_err(SignalingError::HeaderNormalization)?;
+        let value = trim_horizontal_whitespace(logical.as_ref());
+        match kind {
+            Some(HeaderKind::Contact) => {
+                let contact = Contact::from_bytes(value).map_err(SignalingError::Contact)?;
+                let entries = contact
+                    .entries()
+                    .ok_or(SignalingError::InvalidDialogContact)?;
+                for entry in entries {
+                    if remote_target.is_some() {
+                        return Err(SignalingError::InvalidDialogContact);
+                    }
+                    remote_target = Some(entry.address().uri().clone());
+                }
+            }
+            Some(HeaderKind::RecordRoute) => {
+                let record_route =
+                    RecordRoute::from_bytes(value).map_err(SignalingError::RecordRoute)?;
+                let attempted = routes
+                    .len()
+                    .checked_add(record_route.entries().len())
+                    .ok_or(SignalingError::DialogRoute(
+                        DialogRouteError::TooManyRoutes {
+                            count: usize::MAX,
+                            maximum: MAX_DIALOG_ROUTES,
+                        },
+                    ))?;
+                if attempted > MAX_DIALOG_ROUTES {
+                    return Err(SignalingError::DialogRoute(
+                        DialogRouteError::TooManyRoutes {
+                            count: attempted,
+                            maximum: MAX_DIALOG_ROUTES,
+                        },
+                    ));
+                }
+                routes
+                    .try_reserve_exact(record_route.entries().len())
+                    .map_err(|_| SignalingError::AllocationFailed)?;
+                routes.extend(
+                    record_route
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.uri().clone()),
+                );
+            }
+            _ => {}
+        }
+    }
+    let remote_target = remote_target.unwrap_or_else(|| fallback_target.clone());
+    let route_set = RouteSet::for_uac(routes).map_err(SignalingError::DialogRoute)?;
+    Ok((remote_target, route_set))
+}
+
+fn route_header(routes: &[Uri]) -> Result<Route, SignalingError> {
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(routes.len())
+        .map_err(|_| SignalingError::AllocationFailed)?;
+    for uri in routes {
+        entries.push(
+            RecordRouteEntry::new(Address::name_addr(uri.clone()))
+                .map_err(SignalingError::RecordRoute)?,
+        );
+    }
+    Route::from_entries(entries).map_err(SignalingError::Route)
+}
+
+fn build_response(
+    request: &ValidatedRequest,
+    ingress: &IngressMeta,
+    status: StatusCode,
+) -> Result<Arc<[u8]>, SignalingError> {
+    let headers = request.core_headers();
+    let via = ingress
+        .response_via(headers.via())
+        .map_err(SignalingError::Flow)?;
+    let mut to = headers.to_header().clone();
+    if to.tag().is_none() {
+        let tag = generate_wire_token().map_err(SignalingError::WireToken)?;
+        to.set_tag(tag).map_err(SignalingError::To)?;
+    }
+    let reason = status.default_reason_phrase().unwrap_or("Response");
+    let bytes = ResponseBuilder::new(
+        status,
+        reason.as_bytes(),
+        &via,
+        headers.from_header(),
+        &to,
+        headers.call_id(),
+        headers.cseq(),
+    )
+    .map_err(SignalingError::ResponseBuild)?
+    .serialize()
+    .map_err(SignalingError::ResponseBuild)?;
+    Ok(Arc::from(bytes.into_boxed_slice()))
+}
+
 fn serialize_and_validate(builder: RequestBuilder) -> Result<ValidatedRequest, SignalingError> {
     let request = builder
         .build()
@@ -757,11 +1190,20 @@ impl fmt::Debug for UdpSignaling {
     }
 }
 
-fn timer_kind(timer: Timer) -> u16 {
+fn client_timer_kind(timer: ClientTimer) -> u16 {
     match timer {
-        Timer::Retransmit => 1,
-        Timer::RequestTimeout => 2,
-        Timer::Linger => 3,
+        ClientTimer::Retransmit => 1,
+        ClientTimer::RequestTimeout => 2,
+        ClientTimer::Linger => 3,
+    }
+}
+
+fn server_timer_kind(timer: ServerTimer) -> u16 {
+    match timer {
+        ServerTimer::Trying => 101,
+        ServerTimer::Retransmit => 102,
+        ServerTimer::FinalResponseLifetime => 103,
+        ServerTimer::Termination => 104,
     }
 }
 
@@ -793,6 +1235,8 @@ fn response_event(response: &ValidatedResponse) -> Result<Option<CallEvent>, Sig
 /// Executable UDP signaling failure.
 #[derive(Debug)]
 pub enum SignalingError {
+    /// A wildcard client bind could not be resolved to a concrete route source.
+    OutboundBind(OutboundBindError),
     /// Concrete remote endpoint was invalid.
     Destination(crate::sip::transport::destination::DestinationError),
     /// UDP socket, receive, parse, validation, or send failed.
@@ -801,6 +1245,8 @@ pub enum SignalingError {
     Udp(UdpError),
     /// Client transaction construction failed.
     Client(crate::sip::transaction::client::ClientError),
+    /// Server transaction construction failed.
+    Server(crate::sip::transaction::server::ServerError),
     /// Transaction manager rejected an operation.
     Transactions(ManagerError),
     /// Shared deadline scheduler rejected an operation.
@@ -833,12 +1279,28 @@ pub enum SignalingError {
     Parse(crate::sip::parser::message::ParseError),
     /// Generated request semantic validation unexpectedly failed.
     ValidateRequest(crate::sip::validation::request::ValidationError),
-    /// Opaque transaction branch allocation exhausted.
-    IdentifierExhausted,
+    /// Cryptographically strong SIP wire-token generation failed.
+    WireToken(WireTokenError),
+    /// Inbound request transport metadata could not form a response Via.
+    Flow(FlowError),
+    /// Inbound response To-tag generation violated typed header bounds.
+    To(crate::sip::headers::to::ParseError),
+    /// Canonical inbound SIP response construction failed.
+    ResponseBuild(crate::sip::builder::response::BuildError),
+    /// Transport produced an internally inconsistent inbound message variant.
+    InvalidInboundMessage,
     /// In-dialog action referenced an unknown fork branch.
     UnknownDialogBranch,
-    /// Confirmed fork branch storage reached its hard bound.
-    DialogBranchCapacity,
+    /// A dialog-forming response or request had invalid identity.
+    DialogId(DialogIdError),
+    /// The authoritative dialog registry rejected an operation.
+    Dialogs(DialogManagerError),
+    /// Authoritative dialog state rejected an operation.
+    Dialog(DialogError),
+    /// The deterministic branch identity disagreed with the response To-tag.
+    DialogBranchMismatch,
+    /// The initial UAC From field lacked the required local tag.
+    MissingLocalDialogTag,
     /// No further in-dialog `CSeq` could be represented.
     SequenceExhausted,
     /// Generated Via address was not reachable or did not match the socket port.
@@ -857,6 +1319,16 @@ pub enum SignalingError {
     Authorization(crate::sip::headers::authorization::ParseError),
     /// Calculated proxy credentials violated an internal invariant.
     ProxyAuthorization(crate::sip::headers::proxy_authorization::ParseError),
+    /// A dialog-forming response carried an invalid Contact field.
+    Contact(crate::sip::headers::contact::ParseError),
+    /// A dialog-forming response lacked one unambiguous remote Contact target.
+    InvalidDialogContact,
+    /// A dialog-forming response carried an invalid Record-Route field.
+    RecordRoute(crate::sip::headers::record_route::ParseError),
+    /// The aggregate dialog route set exceeded its operational bound.
+    DialogRoute(DialogRouteError),
+    /// Generated in-dialog Route fields violated their bounded grammar.
+    Route(crate::sip::headers::route::ParseError),
 }
 
 impl fmt::Display for SignalingError {
@@ -877,6 +1349,7 @@ mod tests {
     use crate::call::events::{CallAction, CallEvent};
     use crate::runtime::deadline::DeadlineScheduler;
     use crate::sip::auth::{AuthContext, DigestCredentials};
+    use crate::sip::dialog::DialogManager;
     use crate::sip::parser::message;
     use crate::sip::transaction::manager::TransactionManager;
     use crate::sip::transport::udp::UdpConfig;
@@ -918,6 +1391,7 @@ mod tests {
     fn poll_until_datagram_processed(
         signaling: &mut UdpSignaling,
         transactions: &mut TransactionManager,
+        dialogs: &mut DialogManager,
         deadlines: &mut DeadlineScheduler,
         authentication: &mut AuthContext,
         first_tick: u64,
@@ -926,6 +1400,7 @@ mod tests {
             let events = signaling
                 .poll(
                     transactions,
+                    dialogs,
                     deadlines,
                     authentication,
                     Duration::from_millis(tick),
@@ -983,6 +1458,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("install"));
         let mut transactions =
             TransactionManager::new(8).unwrap_or_else(|_| panic!("transactions"));
+        let mut dialogs = DialogManager::new(16).unwrap_or_else(|_| panic!("dialogs"));
         let mut deadlines = DeadlineScheduler::new(32).unwrap_or_else(|_| panic!("deadlines"));
         let mut authentication = AuthContext::new();
         signaling
@@ -1008,6 +1484,7 @@ mod tests {
         let events = poll_until_datagram_processed(
             &mut signaling,
             &mut transactions,
+            &mut dialogs,
             &mut deadlines,
             &mut authentication,
             1,
@@ -1044,6 +1521,7 @@ mod tests {
             let events = signaling
                 .poll(
                     &mut transactions,
+                    &mut dialogs,
                     &mut deadlines,
                     &mut authentication,
                     Duration::from_millis(tick),
@@ -1102,6 +1580,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("install"));
         let mut transactions =
             TransactionManager::new(8).unwrap_or_else(|_| panic!("transactions"));
+        let mut dialogs = DialogManager::new(16).unwrap_or_else(|_| panic!("dialogs"));
         let mut deadlines = DeadlineScheduler::new(32).unwrap_or_else(|_| panic!("deadlines"));
         let mut authentication = AuthContext::new();
 
@@ -1113,6 +1592,9 @@ mod tests {
             .recv_from(&mut received)
             .unwrap_or_else(|_| panic!("receive INVITE"));
         assert!(received[..length].starts_with(b"INVITE "));
+        let initial_invite =
+            std::str::from_utf8(&received[..length]).unwrap_or_else(|_| panic!("INVITE UTF-8"));
+        let initial_via = header_value(initial_invite, "Via:").to_owned();
 
         let response = |status: u16, reason: &str| {
             format!(
@@ -1133,6 +1615,7 @@ mod tests {
             events = signaling
                 .poll(
                     &mut transactions,
+                    &mut dialogs,
                     &mut deadlines,
                     &mut authentication,
                     Duration::from_millis(tick),
@@ -1148,6 +1631,7 @@ mod tests {
             .execute_call_actions(
                 &[CallAction::SendCancel],
                 &mut transactions,
+                &mut dialogs,
                 &mut deadlines,
                 Duration::from_millis(100),
             )
@@ -1156,6 +1640,9 @@ mod tests {
             .recv_from(&mut received)
             .unwrap_or_else(|_| panic!("receive CANCEL"));
         assert!(received[..cancel_length].starts_with(b"CANCEL "));
+        let cancel = std::str::from_utf8(&received[..cancel_length])
+            .unwrap_or_else(|_| panic!("CANCEL UTF-8"));
+        assert_eq!(header_value(cancel, "Via:"), initial_via);
 
         let failure = response(486, "Busy Here");
         peer.send_to(failure.as_bytes(), source)
@@ -1165,6 +1652,7 @@ mod tests {
             events = signaling
                 .poll(
                     &mut transactions,
+                    &mut dialogs,
                     &mut deadlines,
                     &mut authentication,
                     Duration::from_millis(tick),
@@ -1192,6 +1680,7 @@ mod tests {
             events = signaling
                 .poll(
                     &mut transactions,
+                    &mut dialogs,
                     &mut deadlines,
                     &mut authentication,
                     Duration::from_millis(tick),
@@ -1216,6 +1705,7 @@ mod tests {
                     },
                 ],
                 &mut transactions,
+                &mut dialogs,
                 &mut deadlines,
                 Duration::from_millis(301),
             )
@@ -1228,5 +1718,141 @@ mod tests {
             .recv_from(&mut received)
             .unwrap_or_else(|_| panic!("receive BYE"));
         assert!(received[..bye_length].starts_with(b"BYE "));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one wire scenario verifies inbound dialog routing and retransmission"
+    )]
+    fn remote_bye_is_answered_once_and_retransmission_replays_200() {
+        let peer = UdpSocket::bind(localhost(0)).unwrap_or_else(|_| panic!("peer"));
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap_or_else(|_| panic!("timeout"));
+        let remote = peer.local_addr().unwrap_or_else(|_| panic!("peer address"));
+        let mut signaling = UdpSignaling::bind(
+            localhost(0),
+            remote,
+            UdpDriverConfig::default(),
+            UdpConfig::default(),
+        )
+        .unwrap_or_else(|_| panic!("signaling"));
+        let local = signaling.local_addr();
+        let invite = format!(
+            "INVITE sip:service@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {local};branch=z9hG4bK-inbound-test\r\n\
+             From: <sip:runtime@127.0.0.1>;tag=local-tag\r\n\
+             To: <sip:service@127.0.0.1>\r\n\
+             Call-ID: inbound-test@127.0.0.1\r\n\
+             CSeq: 1 INVITE\r\n\
+             Max-Forwards: 70\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        let raw = message::parse(Arc::from(invite.into_bytes()))
+            .unwrap_or_else(|_| panic!("parse INVITE"));
+        signaling
+            .install_initial_invite(
+                validation::request::validate(raw).unwrap_or_else(|_| panic!("validate INVITE")),
+            )
+            .unwrap_or_else(|_| panic!("install"));
+        let mut transactions =
+            TransactionManager::new(16).unwrap_or_else(|_| panic!("transactions"));
+        let mut dialogs = DialogManager::new(16).unwrap_or_else(|_| panic!("dialogs"));
+        let mut deadlines = DeadlineScheduler::new(64).unwrap_or_else(|_| panic!("deadlines"));
+        let mut authentication = AuthContext::new();
+        signaling
+            .start(&mut transactions, &mut deadlines, Duration::ZERO)
+            .unwrap_or_else(|_| panic!("start"));
+        let mut buffer = [0_u8; 2_048];
+        let (wire_invite, source) = receive_request(&peer, &mut buffer);
+        let success = format!(
+            "SIP/2.0 200 OK\r\n\
+             Via: {}\r\n\
+             From: <sip:runtime@127.0.0.1>;tag=local-tag\r\n\
+             To: <sip:service@127.0.0.1>;tag=remote-tag\r\n\
+             Call-ID: inbound-test@127.0.0.1\r\n\
+             CSeq: 1 INVITE\r\n\
+             Contact: <sip:service@{remote}>\r\n\
+             Content-Length: 0\r\n\r\n",
+            header_value(&wire_invite, "Via:")
+        );
+        peer.send_to(success.as_bytes(), source)
+            .unwrap_or_else(|_| panic!("send 200"));
+        let mut accepted = Vec::new();
+        for tick in 1..=100 {
+            accepted = signaling
+                .poll(
+                    &mut transactions,
+                    &mut dialogs,
+                    &mut deadlines,
+                    &mut authentication,
+                    Duration::from_millis(tick),
+                )
+                .unwrap_or_else(|_| panic!("poll 200"));
+            if !accepted.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            accepted.as_slice(),
+            [CallEvent::InviteAccepted { .. }]
+        ));
+
+        let bye = format!(
+            "BYE sip:runtime@{local} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {remote};branch=z9hG4bK-remote-bye\r\n\
+             From: <sip:service@127.0.0.1>;tag=remote-tag\r\n\
+             To: <sip:runtime@127.0.0.1>;tag=local-tag\r\n\
+             Call-ID: inbound-test@127.0.0.1\r\n\
+             CSeq: 2 BYE\r\n\
+             Max-Forwards: 70\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        peer.send_to(bye.as_bytes(), source)
+            .unwrap_or_else(|_| panic!("send BYE"));
+        let mut bye_events = Vec::new();
+        for tick in 101..=200 {
+            bye_events = signaling
+                .poll(
+                    &mut transactions,
+                    &mut dialogs,
+                    &mut deadlines,
+                    &mut authentication,
+                    Duration::from_millis(tick),
+                )
+                .unwrap_or_else(|_| panic!("poll BYE"));
+            if !bye_events.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(bye_events, vec![CallEvent::RemoteBye]);
+        let (first_response, _) = receive_request(&peer, &mut buffer);
+        assert!(first_response.starts_with("SIP/2.0 200 OK\r\n"));
+        assert_eq!(header_value(&first_response, "CSeq:"), "2 BYE");
+
+        peer.send_to(bye.as_bytes(), source)
+            .unwrap_or_else(|_| panic!("retransmit BYE"));
+        let received_before = signaling.received;
+        let mut replay_events = Vec::new();
+        for tick in 201..=300 {
+            replay_events = signaling
+                .poll(
+                    &mut transactions,
+                    &mut dialogs,
+                    &mut deadlines,
+                    &mut authentication,
+                    Duration::from_millis(tick),
+                )
+                .unwrap_or_else(|_| panic!("poll retransmission"));
+            if signaling.received > received_before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(replay_events.is_empty());
+        let (replayed, _) = receive_request(&peer, &mut buffer);
+        assert_eq!(replayed, first_response);
     }
 }
