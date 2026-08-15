@@ -7,6 +7,8 @@ use std::error::Error as StdError;
 use std::fmt;
 
 use crate::call::execution::deadline::{DeadlineError, DeadlineOwner};
+use crate::call::media::MediaSessionBuildError;
+use crate::call::media::controller::MediaControlError;
 use crate::call::model::context::CallContextError;
 use crate::call::model::redirect::RedirectError;
 use crate::call::signaling::SignalingError;
@@ -42,6 +44,16 @@ pub enum CallRuntimeError {
     MediaSocket(SocketError),
     /// Outbound RTP encoding, policy, or wire execution failed.
     RtpWire(RtpWireSendError),
+    /// Offer/answer generation control rejected a negotiated media update.
+    MediaControl(MediaControlError),
+    /// Negotiated media could not produce a bounded RTP generation.
+    MediaSessionBuild(MediaSessionBuildError),
+    /// Selected SDP answer lacked data required by its disposition.
+    MediaAnswerInvariant,
+    /// A selected answer arrived without its pending local-offer token.
+    MediaOfferUnavailable,
+    /// Negotiated direction forbids outbound RTP.
+    MediaDirectionDisallowsSend,
     /// SIP action required a call-owned signaling driver that was not installed.
     SignalingUnavailable,
     /// Call-owned SIP transport, transaction, or timer execution failed.
@@ -81,12 +93,17 @@ impl StdError for CallRuntimeError {
             Self::Context(source) => Some(source),
             Self::MediaSocket(source) => Some(source),
             Self::RtpWire(source) => Some(source),
+            Self::MediaControl(source) => Some(source),
+            Self::MediaSessionBuild(source) => Some(source),
             Self::Signaling(source) => Some(source),
             Self::WrongOwnerThread
             | Self::ZeroShutdownGrace
             | Self::ResourcesAlreadyInstalled
             | Self::TimeOverflow
             | Self::MediaResourcesUnavailable
+            | Self::MediaAnswerInvariant
+            | Self::MediaOfferUnavailable
+            | Self::MediaDirectionDisallowsSend
             | Self::SignalingUnavailable
             | Self::UnsupportedDeadlineOwner(_)
             | Self::UnknownDeadlineKind { .. }

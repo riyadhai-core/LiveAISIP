@@ -34,4 +34,6 @@ pub struct CallRuntimeDiagnostics {
     pub dtmf_packets_received: u64,
     /// Valid compound RTCP datagrams admitted to session state.
     pub rtcp_packets_accepted: u64,
+    /// SDP answers rejected before they could create or replace RTP state.
+    pub media_negotiation_failures: u64,
 }

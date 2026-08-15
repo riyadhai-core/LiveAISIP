@@ -77,6 +77,11 @@ pub enum AudioError {
         /// Supplied sample count.
         actual: usize,
     },
+    /// Network-side PCMU PCM frame had the wrong sample count.
+    InvalidPcmuFrameSamples {
+        /// Supplied sample count.
+        actual: usize,
+    },
     /// Clock rate or packet time was outside bounds.
     InvalidPacketization,
     /// Packet time produced fractional codec samples.

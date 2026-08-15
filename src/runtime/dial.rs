@@ -30,9 +30,11 @@ use std::num::ParseIntError;
 use std::time::Duration;
 
 use crate::call::execution::runtime::{CallRuntime, CallRuntimeConfig, CallRuntimeError};
+use crate::call::media::MediaSessionPolicy;
 use crate::call::model::context::{CallContext, CallContextError, DEFAULT_CALL_TIMELINE_CAPACITY};
 use crate::call::signaling::{
-    OutboundInviteConfig, OutboundInviteError, SignalingError, UdpSignaling,
+    MediaAnswerError, MediaAnswerPolicy, OutboundInviteConfig, OutboundInviteError, SignalingError,
+    UdpSignaling,
 };
 use crate::runtime::admission::AdmissionLeaseGroup;
 use crate::runtime::media_offer::{MediaOfferConfig, MediaOfferError};
@@ -241,6 +243,8 @@ impl OutboundDialConfig {
         }
 
         let mut prepared_media: Option<PreparedMediaSession> = None;
+        let mut media_activation_policy: Option<MediaSessionPolicy> = None;
+        let mut media_answer_policy: Option<MediaAnswerPolicy> = None;
         let mut invite = OutboundInviteConfig::new(self.caller, self.target, advertised_addr)
             .map_err(OutboundDialError::Invite)?;
         match self.body {
@@ -253,10 +257,20 @@ impl OutboundDialConfig {
                 invite = invite.with_sdp(&body).map_err(OutboundDialError::Invite)?;
             }
             InviteBody::MediaSession(config) => {
+                if self.runtime.requires_secure_media() {
+                    return Err(OutboundDialError::SecureMediaProfileUnavailable);
+                }
                 let media = config.prepare().map_err(OutboundDialError::MediaSession)?;
-                let body = render_media_offer(media.offer())?;
+                let offer = media.offer();
+                let direction = offer.direction();
+                let answer_policy = MediaAnswerPolicy::pcmu(self.runtime.requires_secure_media())
+                    .map_err(OutboundDialError::MediaAnswerPolicy)?
+                    .with_direction_capabilities(direction.sends(), direction.receives());
+                let body = render_media_offer(offer)?;
                 invite = invite.with_sdp(&body).map_err(OutboundDialError::Invite)?;
                 prepared_media = Some(media);
+                media_activation_policy = Some(MediaSessionPolicy::default());
+                media_answer_policy = Some(answer_policy);
             }
             InviteBody::InactivePcmu => {
                 let offer = MediaOfferConfig::pcmu(SocketAddr::new(advertised_addr.ip(), 9))?
@@ -265,6 +279,9 @@ impl OutboundDialConfig {
                 let body = render_media_offer(offer)?;
                 invite = invite.with_sdp(&body).map_err(OutboundDialError::Invite)?;
             }
+        }
+        if let Some(policy) = media_answer_policy {
+            signaling = signaling.with_media_answer_policy(policy);
         }
         signaling
             .install_initial_invite(invite.build().map_err(OutboundDialError::Invite)?)
@@ -285,6 +302,12 @@ impl OutboundDialConfig {
                 .with_media_sockets(sockets)
                 .and_then(|runtime| runtime.with_packet_scratch(scratch))
                 .and_then(|runtime| runtime.with_rtp_sender(sender))
+                .and_then(|runtime| {
+                    runtime.with_media_session_policy(
+                        media_activation_policy
+                            .ok_or(CallRuntimeError::MediaResourcesUnavailable)?,
+                    )
+                })
                 .map_err(OutboundDialError::Runtime)?;
             (Some(local), Some(advertised))
         } else {
@@ -410,6 +433,10 @@ pub enum OutboundDialError {
     MediaOffer(MediaOfferError),
     /// Call-owned local RTP/RTCP preparation failed.
     MediaSession(MediaSessionError),
+    /// Clear-only local media preparation cannot satisfy secure-media policy.
+    SecureMediaProfileUnavailable,
+    /// Static media-answer policy construction failed.
+    MediaAnswerPolicy(MediaAnswerError),
 }
 
 impl fmt::Display for OutboundDialError {
@@ -429,12 +456,14 @@ impl StdError for OutboundDialError {
             Self::SessionId(error) => Some(error),
             Self::MediaOffer(error) => Some(error),
             Self::MediaSession(error) => Some(error),
+            Self::MediaAnswerPolicy(error) => Some(error),
             Self::CallerNotSip
             | Self::TargetNotSip
             | Self::InvalidAdvertisedAddress
             | Self::EmptySdp
             | Self::SdpTooLarge { .. }
-            | Self::AllocationFailed => None,
+            | Self::AllocationFailed
+            | Self::SecureMediaProfileUnavailable => None,
         }
     }
 }

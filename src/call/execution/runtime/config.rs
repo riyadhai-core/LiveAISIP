@@ -59,6 +59,12 @@ impl CallRuntimeConfig {
     pub const fn shutdown_grace(self) -> Duration {
         self.shutdown_grace
     }
+
+    /// Returns whether negotiated media must use a secure RTP profile.
+    #[must_use]
+    pub const fn requires_secure_media(self) -> bool {
+        self.require_secure_media
+    }
 }
 
 impl Default for CallRuntimeConfig {

@@ -262,6 +262,38 @@ impl MediaController {
         self.replace(negotiated, remote_rtp)
     }
 
+    /// Completes a local offer whose remote answer disables this media stream.
+    ///
+    /// Port-zero rejection, an inactive answer, and an unspecified hold
+    /// connection all retire the previous RTP generation. The offer/answer
+    /// state and generation counter are committed only after every check
+    /// succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale offer ownership, a draining controller, or exhausted
+    /// generation space.
+    pub fn apply_remote_disabled_answer(
+        &mut self,
+        token: OfferToken,
+    ) -> Result<u64, MediaControlError> {
+        if self.lifecycle != MediaLifecycle::Active {
+            return Err(MediaControlError::NotActive);
+        }
+        let generation = self.next_generation;
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or(MediaControlError::GenerationExhausted)?;
+        let mut offers = self.offers.clone();
+        offers
+            .apply_remote_answer(token)
+            .map_err(MediaControlError::OfferAnswer)?;
+        self.offers = offers;
+        self.next_generation = next_generation;
+        self.active = None;
+        Ok(generation)
+    }
+
     /// Atomically commits local answer to a remote offer.
     ///
     /// # Errors
@@ -585,6 +617,25 @@ mod tests {
             controller.active().map(super::ActiveMedia::remote_rtp),
             Some(final_endpoint)
         );
+    }
+
+    #[test]
+    fn disabled_answer_completes_offer_and_retires_active_generation() {
+        let mut controller = MediaController::new(false);
+        let endpoint = SocketAddr::from(([192, 0, 2, 1], 4000));
+        controller
+            .begin_local_offer()
+            .and_then(|token| controller.apply_remote_answer(token, media(false), endpoint))
+            .unwrap_or_else(|_| panic!("active"));
+        let active_token = controller.work_token().unwrap_or_else(|| panic!("token"));
+        let disabled_generation = controller
+            .begin_local_offer()
+            .and_then(|token| controller.apply_remote_disabled_answer(token))
+            .unwrap_or_else(|_| panic!("disabled"));
+        assert!(disabled_generation > active_token.generation());
+        assert!(controller.active().is_none());
+        assert!(controller.work_token().is_none());
+        assert!(!controller.accepts(active_token));
     }
 
     #[test]

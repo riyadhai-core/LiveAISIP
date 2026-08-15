@@ -44,6 +44,7 @@ use std::time::Duration;
 
 use crate::call::execution::deadline::{DeadlineId, DeadlineOwner, DeadlineScheduler};
 use crate::call::media::controller::MediaController;
+use crate::call::media::{ActiveRtpSession, MediaSessionPolicy};
 use crate::rtp::security::PacketProtection;
 use crate::rtp::session::{
     RtcpIngressOutcome, RtpIngressOutcome, RtpSession, RtpWireSendOutcome, RtpWireSender,
@@ -52,6 +53,7 @@ use crate::rtp::transport::{Component, MediaPacketScratch, MediaSocketPair, Sock
 use crate::runtime::admission::AdmissionLeaseGroup;
 use crate::sip::auth::AuthContext;
 use crate::sip::dialog::{DialogManager, PrackTracker, SessionTimer, SessionTimerAction};
+use crate::sip::sdp::OfferToken;
 use crate::sip::transaction::manager::TransactionManager;
 use crate::sip::transport::failover::FailoverPlan;
 use crate::util::time::{advance_periodic, checked_deadline, minimum_deadline};
@@ -61,7 +63,9 @@ use crate::call::model::events::{CallAction, CallCommand, CallEvent};
 use crate::call::model::redirect::RedirectHandler;
 use crate::call::model::state::{CallEndReason, CallState};
 use crate::call::model::transfer::TransferTracker;
-use crate::call::signaling::UdpSignaling;
+use crate::call::signaling::{
+    MediaAnswerOutcome, RemoteMediaAnswer, RemoteMediaDisposition, UdpSignaling,
+};
 
 use super::timer::CallTimer;
 
@@ -87,9 +91,11 @@ pub struct CallRuntime {
     failover: Option<FailoverPlan>,
     deadlines: DeadlineScheduler,
     media: MediaController,
+    media_session_policy: Option<MediaSessionPolicy>,
+    pending_media_offer: Option<OfferToken>,
     media_sockets: Option<MediaSocketPair>,
     packet_scratch: Option<MediaPacketScratch>,
-    rtp_session: Option<RtpSession>,
+    active_rtp: Option<ActiveRtpSession>,
     rtp_sender: Option<RtpWireSender>,
     signaling: Option<UdpSignaling>,
     admission: AdmissionLeaseGroup,
@@ -135,9 +141,11 @@ impl CallRuntime {
             deadlines: DeadlineScheduler::new(config.deadline_capacity)
                 .map_err(CallRuntimeError::Deadlines)?,
             media: MediaController::new(config.require_secure_media),
+            media_session_policy: None,
+            pending_media_offer: None,
             media_sockets: None,
             packet_scratch: None,
-            rtp_session: None,
+            active_rtp: None,
             rtp_sender: None,
             signaling: None,
             admission,
@@ -166,16 +174,54 @@ impl CallRuntime {
         Ok(self)
     }
 
-    /// Installs the preconstructed RTP session before ownership is claimed.
+    /// Installs a preconstructed bidirectional RTP session before ownership is claimed.
     ///
     /// # Errors
     ///
     /// Rejects replacement or installation after the runtime starts.
     pub fn with_rtp_session(mut self, session: RtpSession) -> Result<Self, CallRuntimeError> {
-        if self.owner.is_some() || self.rtp_session.is_some() {
+        if self.owner.is_some() || self.active_rtp.is_some() {
             return Err(CallRuntimeError::ResourcesAlreadyInstalled);
         }
-        self.rtp_session = Some(session);
+        self.active_rtp = Some(
+            ActiveRtpSession::from_prebuilt(session)
+                .map_err(CallRuntimeError::MediaSessionBuild)?,
+        );
+        Ok(self)
+    }
+
+    /// Enables negotiated RTP generation activation for the installed local offer.
+    ///
+    /// This must be called only after sockets, packet scratch, and the RTP
+    /// sender have been installed. It begins the call-owned local offer and
+    /// retains its generation token until a selected fork supplies an answer.
+    ///
+    /// # Errors
+    ///
+    /// Rejects incomplete/duplicate resources, post-start installation, or
+    /// offer/answer arbitration failure.
+    pub fn with_media_session_policy(
+        mut self,
+        policy: MediaSessionPolicy,
+    ) -> Result<Self, CallRuntimeError> {
+        if self.owner.is_some()
+            || self.media_session_policy.is_some()
+            || self.pending_media_offer.is_some()
+        {
+            return Err(CallRuntimeError::ResourcesAlreadyInstalled);
+        }
+        if self.media_sockets.is_none()
+            || self.packet_scratch.is_none()
+            || self.rtp_sender.is_none()
+        {
+            return Err(CallRuntimeError::MediaResourcesUnavailable);
+        }
+        let token = self
+            .media
+            .begin_local_offer()
+            .map_err(CallRuntimeError::MediaControl)?;
+        self.media_session_policy = Some(policy);
+        self.pending_media_offer = Some(token);
         Ok(self)
     }
 
@@ -371,10 +417,12 @@ impl CallRuntime {
             .packet_scratch
             .as_mut()
             .ok_or(CallRuntimeError::MediaResourcesUnavailable)?;
-        let session = self
-            .rtp_session
+        let active = self
+            .active_rtp
             .as_mut()
             .ok_or(CallRuntimeError::MediaResourcesUnavailable)?;
+        let receive_allowed = active.can_receive();
+        let session = active.session_mut();
 
         for _ in 0..MAX_MEDIA_DATAGRAMS_PER_POLL {
             let datagram = match sockets.receive(component, scratch.receive()) {
@@ -392,6 +440,7 @@ impl CallRuntime {
             self.diagnostics.media_datagrams_received =
                 self.diagnostics.media_datagrams_received.saturating_add(1);
             let accepted = match component {
+                Component::Rtp if !receive_allowed => false,
                 Component::Rtp => match session.ingest_rtp(
                     datagram.source(),
                     datagram.payload(),
@@ -454,31 +503,37 @@ impl CallRuntime {
     /// transaction, deadline, and lifecycle failures.
     pub fn poll_signaling(&mut self, now: Duration) -> Result<Vec<CallAction>, CallRuntimeError> {
         self.verify_owner()?;
-        let signaling = self
-            .signaling
-            .as_mut()
-            .ok_or(CallRuntimeError::SignalingUnavailable)?;
-        let events = signaling
-            .poll(
-                &mut self.transactions,
-                &mut self.dialogs,
-                &mut self.deadlines,
-                &mut self.authentication,
-                now,
-            )
-            .map_err(CallRuntimeError::Signaling)?;
-        self.diagnostics.signaling_reflexive_endpoint_observed =
-            signaling.observed_reflexive_addr().is_some();
-        self.diagnostics.signaling_advertised_endpoint_mismatch =
-            signaling.advertised_addr_matches_observation() == Some(false);
+        let outcomes = {
+            let signaling = self
+                .signaling
+                .as_mut()
+                .ok_or(CallRuntimeError::SignalingUnavailable)?;
+            let outcomes = signaling
+                .poll(
+                    &mut self.transactions,
+                    &mut self.dialogs,
+                    &mut self.deadlines,
+                    &mut self.authentication,
+                    now,
+                )
+                .map_err(CallRuntimeError::Signaling)?;
+            self.diagnostics.signaling_reflexive_endpoint_observed =
+                signaling.observed_reflexive_addr().is_some();
+            self.diagnostics.signaling_advertised_endpoint_mismatch =
+                signaling.advertised_addr_matches_observation() == Some(false);
+            outcomes
+        };
         let mut actions = Vec::new();
-        for event in events {
+        for outcome in outcomes {
+            let (event, media_result) = outcome.into_parts();
             let produced = self
                 .context
                 .handle(event, now)
                 .map_err(CallRuntimeError::Context)?;
             self.diagnostics.last_sip_status = self.context.lifecycle().last_sip_status();
-            signaling
+            self.signaling
+                .as_mut()
+                .ok_or(CallRuntimeError::SignalingUnavailable)?
                 .execute_call_actions(
                     &produced,
                     &mut self.transactions,
@@ -487,9 +542,124 @@ impl CallRuntime {
                     now,
                 )
                 .map_err(CallRuntimeError::Signaling)?;
+            let mut followup = Vec::new();
+            match media_result {
+                Some(MediaAnswerOutcome::Negotiated(answer)) => {
+                    self.apply_remote_media_answer(&produced, answer.as_ref(), now)?;
+                }
+                Some(MediaAnswerOutcome::Invalid(_)) => {
+                    self.diagnostics.media_negotiation_failures = self
+                        .diagnostics
+                        .media_negotiation_failures
+                        .saturating_add(1);
+                    let selected = produced
+                        .iter()
+                        .any(|action| matches!(action, CallAction::SelectBranch { .. }));
+                    if selected {
+                        followup = self
+                            .context
+                            .handle(CallEvent::Command(CallCommand::Hangup), now)
+                            .map_err(CallRuntimeError::Context)?;
+                        self.signaling
+                            .as_mut()
+                            .ok_or(CallRuntimeError::SignalingUnavailable)?
+                            .execute_call_actions(
+                                &followup,
+                                &mut self.transactions,
+                                &mut self.dialogs,
+                                &mut self.deadlines,
+                                now,
+                            )
+                            .map_err(CallRuntimeError::Signaling)?;
+                    }
+                }
+                None => {}
+            }
             actions.extend(produced);
+            actions.extend(followup);
         }
         Ok(actions)
+    }
+
+    fn apply_remote_media_answer(
+        &mut self,
+        actions: &[CallAction],
+        answer: &RemoteMediaAnswer,
+        now: Duration,
+    ) -> Result<(), CallRuntimeError> {
+        let selected = actions.iter().any(|action| match action {
+            CallAction::ApplyEarlyMedia { branch } | CallAction::SelectBranch { branch } => {
+                branch == answer.branch()
+            }
+            _ => false,
+        });
+        if !selected {
+            return Ok(());
+        }
+
+        match answer.disposition() {
+            RemoteMediaDisposition::Active => {
+                let negotiated = answer
+                    .negotiated()
+                    .ok_or(CallRuntimeError::MediaAnswerInvariant)?;
+                let remote_rtp = answer
+                    .remote_rtp_addr()
+                    .ok_or(CallRuntimeError::MediaAnswerInvariant)?;
+                if self.media.active().is_some_and(|active| {
+                    active.negotiated() == negotiated && active.remote_rtp() == remote_rtp
+                }) && self.active_rtp.is_some()
+                {
+                    return Ok(());
+                }
+
+                let token = self
+                    .pending_media_offer
+                    .ok_or(CallRuntimeError::MediaOfferUnavailable)?;
+                let policy = self
+                    .media_session_policy
+                    .ok_or(CallRuntimeError::MediaResourcesUnavailable)?;
+                let local_ssrc = self
+                    .rtp_sender
+                    .as_ref()
+                    .ok_or(CallRuntimeError::MediaResourcesUnavailable)?
+                    .state()
+                    .config()
+                    .ssrc();
+                let mut next_media = self.media.clone();
+                let activation = {
+                    let active = next_media
+                        .apply_remote_answer(token, negotiated.clone(), remote_rtp)
+                        .map_err(CallRuntimeError::MediaControl)?;
+                    policy
+                        .activate(active, local_ssrc, now)
+                        .map_err(CallRuntimeError::MediaSessionBuild)?
+                };
+                let active_rtp = activation.into_active();
+                self.media = next_media;
+                self.pending_media_offer = None;
+                self.active_rtp = active_rtp;
+                self.next_media_deadline = self
+                    .active_rtp
+                    .as_ref()
+                    .map(|_| checked_deadline(now, MEDIA_TICK_INTERVAL))
+                    .transpose()
+                    .map_err(|_| CallRuntimeError::TimeOverflow)?;
+            }
+            RemoteMediaDisposition::Held | RemoteMediaDisposition::Rejected => {
+                let token = self
+                    .pending_media_offer
+                    .ok_or(CallRuntimeError::MediaOfferUnavailable)?;
+                let mut next_media = self.media.clone();
+                next_media
+                    .apply_remote_disabled_answer(token)
+                    .map_err(CallRuntimeError::MediaControl)?;
+                self.media = next_media;
+                self.pending_media_offer = None;
+                self.active_rtp = None;
+                self.next_media_deadline = None;
+            }
+        }
+        Ok(())
     }
 
     /// Schedules one generation-fenced call-local deadline.
@@ -660,7 +830,9 @@ impl CallRuntime {
         self.media.begin_draining();
         self.media.close();
         self.signaling = None;
-        self.rtp_session = None;
+        self.active_rtp = None;
+        self.pending_media_offer = None;
+        self.media_session_policy = None;
         self.rtp_sender = None;
         self.media_sockets = None;
         self.packet_scratch = None;
@@ -711,14 +883,16 @@ impl CallRuntime {
         Ok(&mut self.media)
     }
 
-    /// Returns owner-only mutable RTP session state when negotiated.
+    /// Returns owner-only direction- and generation-gated RTP state.
     ///
     /// # Errors
     ///
     /// Rejects access from a non-owner thread.
-    pub fn rtp_session(&mut self) -> Result<Option<&mut RtpSession>, CallRuntimeError> {
+    pub fn active_rtp_session(
+        &mut self,
+    ) -> Result<Option<&mut ActiveRtpSession>, CallRuntimeError> {
         self.verify_owner()?;
-        Ok(self.rtp_session.as_mut())
+        Ok(self.active_rtp.as_mut())
     }
 
     /// Returns owner-only RTP/RTCP socket ownership when allocated.
@@ -750,10 +924,13 @@ impl CallRuntime {
             .rtp_sender
             .as_mut()
             .ok_or(CallRuntimeError::MediaResourcesUnavailable)?;
-        let session = self
-            .rtp_session
+        let active = self
+            .active_rtp
             .as_mut()
             .ok_or(CallRuntimeError::MediaResourcesUnavailable)?;
+        let session = active
+            .send_session()
+            .ok_or(CallRuntimeError::MediaDirectionDisallowsSend)?;
         let sockets = self
             .media_sockets
             .as_ref()
@@ -920,7 +1097,7 @@ impl fmt::Debug for CallRuntime {
             .field("deadlines", &self.deadlines.len())
             .field("media_sockets", &self.media_sockets.is_some())
             .field("packet_scratch", &self.packet_scratch.is_some())
-            .field("rtp_session", &self.rtp_session.is_some())
+            .field("active_rtp", &self.active_rtp.is_some())
             .field("rtp_sender", &self.rtp_sender.is_some())
             .field("signaling", &self.signaling.is_some())
             .field("shutting_down", &self.shutting_down)
@@ -958,7 +1135,10 @@ mod tests {
         SocketConfig,
     };
     use crate::runtime::admission::AdmissionLeaseGroup;
+    use crate::runtime::dial::OutboundDialConfig;
+    use crate::runtime::media_session::MediaSessionConfig;
     use crate::sip::dialog::{Refresher, SessionTimer};
+    use crate::sip::parser::uri;
 
     fn runtime() -> CallRuntime {
         let context = CallContext::new(Duration::ZERO, 16).unwrap_or_else(|_| panic!("context"));
@@ -1029,6 +1209,33 @@ mod tests {
         packet[8..12].copy_from_slice(&7_u32.to_be_bytes());
         packet[12] = 0x55;
         packet
+    }
+
+    fn header_value<'a>(message: &'a str, name: &str) -> &'a str {
+        message
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix(name))
+            .map_or_else(|| panic!("missing header"), str::trim)
+    }
+
+    fn prepared_media_runtime(
+        caller: &crate::sip::types::uri::Uri,
+        target: &crate::sip::types::uri::Uri,
+        destination: SocketAddr,
+    ) -> CallRuntime {
+        (42_000_u16..60_000)
+            .step_by(2)
+            .find_map(|port| {
+                let pool = PortPool::new(port, port).ok()?;
+                let media = MediaSessionConfig::pcmu(pool, IpAddr::V4(Ipv4Addr::LOCALHOST));
+                OutboundDialConfig::new(caller.clone(), target.clone(), address(0), destination)
+                    .ok()?
+                    .with_media_session(media)
+                    .prepare(AdmissionLeaseGroup::new())
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("prepared"))
+            .into_runtime()
     }
 
     #[test]
@@ -1235,6 +1442,105 @@ mod tests {
             runtime.poll_network(Component::Rtp, Duration::ZERO),
             Err(CallRuntimeError::MediaResourcesUnavailable)
         ));
+    }
+
+    #[test]
+    fn routed_success_sdp_acks_and_activates_generation_and_media_clock() {
+        let peer = UdpSocket::bind(address(0)).unwrap_or_else(|_| panic!("peer"));
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap_or_else(|_| panic!("timeout"));
+        let destination = peer.local_addr().unwrap_or_else(|_| panic!("destination"));
+        let remote_media = UdpSocket::bind(address(0)).unwrap_or_else(|_| panic!("remote media"));
+        let remote_rtp = remote_media
+            .local_addr()
+            .unwrap_or_else(|_| panic!("remote RTP"));
+        if remote_rtp.port() == u16::MAX {
+            return;
+        }
+        let caller =
+            uri::parse_str("sip:runtime@example.invalid").unwrap_or_else(|_| panic!("caller"));
+        let target =
+            uri::parse_str("sip:service@example.invalid").unwrap_or_else(|_| panic!("target"));
+        let mut runtime = prepared_media_runtime(&caller, &target, destination);
+        runtime
+            .claim_current_thread()
+            .unwrap_or_else(|_| panic!("claim"));
+        let started = runtime
+            .handle(
+                CallMessage::Event(CallEvent::Command(CallCommand::Start)),
+                Duration::ZERO,
+            )
+            .unwrap_or_else(|_| panic!("start"));
+        assert_eq!(started, vec![CallAction::SendInvite]);
+
+        let mut buffer = [0_u8; 4096];
+        let (length, source) = peer
+            .recv_from(&mut buffer)
+            .unwrap_or_else(|_| panic!("INVITE"));
+        let invite =
+            std::str::from_utf8(&buffer[..length]).unwrap_or_else(|_| panic!("INVITE UTF-8"));
+        let body = format!(
+            "v=0\r\no=fs 1 1 IN IP4 127.0.0.1\r\ns=call\r\n\
+             c=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\n\
+             a=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n\
+             a=fmtp:101 0-16\r\na=ptime:20\r\na=maxptime:20\r\na=sendrecv\r\n",
+            remote_rtp.port()
+        );
+        let response = format!(
+            "SIP/2.0 200 OK\r\nVia: {}\r\nFrom: {}\r\n\
+             To: {};tag=remote-media\r\nCall-ID: {}\r\nCSeq: {}\r\n\
+             Contact: <sip:service@{}>\r\n\
+             Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+            header_value(invite, "Via:"),
+            header_value(invite, "From:"),
+            header_value(invite, "To:"),
+            header_value(invite, "Call-ID:"),
+            header_value(invite, "CSeq:"),
+            destination,
+            body.len(),
+            body,
+        );
+        peer.send_to(response.as_bytes(), source)
+            .unwrap_or_else(|_| panic!("send 200"));
+
+        let mut produced = Vec::new();
+        for tick in 1..=100 {
+            produced = runtime
+                .poll_signaling(Duration::from_millis(tick))
+                .unwrap_or_else(|_| panic!("poll signaling"));
+            if !produced.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            produced.as_slice(),
+            [CallAction::SendAck { .. }, CallAction::SelectBranch { .. }]
+        ));
+        let (ack_length, _) = peer
+            .recv_from(&mut buffer)
+            .unwrap_or_else(|_| panic!("ACK"));
+        assert!(buffer[..ack_length].starts_with(b"ACK "));
+        {
+            let active = runtime
+                .active_rtp_session()
+                .unwrap_or_else(|_| panic!("active access"))
+                .unwrap_or_else(|| panic!("active RTP"));
+            assert_eq!(active.generation(), 1);
+            assert_eq!(active.remote_rtp_addr(), remote_rtp);
+            assert!(active.can_send());
+            assert!(active.can_receive());
+        }
+        assert!(
+            runtime
+                .media()
+                .is_ok_and(|media| media.work_token().is_some())
+        );
+        assert!(
+            runtime
+                .next_deadline()
+                .is_ok_and(|deadline| deadline.is_some())
+        );
     }
 
     #[test]

@@ -60,6 +60,10 @@ use crate::util::time::checked_deadline;
 use super::auth::{collect_challenges, is_retry_managed_header};
 use super::dialog::{dialog_routing, route_header};
 use super::error::SignalingError;
+use super::media::{
+    MediaAnswerError, MediaAnswerPolicy, RemoteMediaAnswer, RemoteMediaDisposition,
+};
+use super::outcome::SignalingOutcome;
 use super::timer::{TimerEntry, TransactionTimer, client_timer_kind, server_timer_kind};
 use super::wire::{build_response, response_event, serialize_and_validate};
 
@@ -93,6 +97,7 @@ pub struct UdpSignaling {
     credentials: Option<DigestCredentials>,
     server_authorization: Option<Authorization>,
     proxy_authorization: Option<ProxyAuthorization>,
+    media_answer_policy: Option<MediaAnswerPolicy>,
     timers: Vec<TimerEntry>,
     received: u64,
     rejected: u64,
@@ -131,6 +136,7 @@ impl UdpSignaling {
             credentials: None,
             server_authorization: None,
             proxy_authorization: None,
+            media_answer_policy: None,
             timers,
             received: 0,
             rejected: 0,
@@ -211,6 +217,13 @@ impl UdpSignaling {
     #[must_use]
     pub fn with_credentials(mut self, credentials: DigestCredentials) -> Self {
         self.credentials = Some(credentials);
+        self
+    }
+
+    /// Enables strict SDP answer negotiation for this call's local offer.
+    #[must_use]
+    pub fn with_media_answer_policy(mut self, policy: MediaAnswerPolicy) -> Self {
+        self.media_answer_policy = Some(policy);
         self
     }
 
@@ -305,8 +318,8 @@ impl UdpSignaling {
         deadlines: &mut DeadlineScheduler,
         authentication: &mut AuthContext,
         now: Duration,
-    ) -> Result<Vec<CallEvent>, SignalingError> {
-        let mut events = Vec::new();
+    ) -> Result<Vec<SignalingOutcome>, SignalingError> {
+        let mut outcomes = Vec::new();
         for _ in 0..MAX_SIGNALING_DATAGRAMS_PER_POLL {
             let received = match self.driver.receive() {
                 Ok(received) => received,
@@ -334,7 +347,7 @@ impl UdpSignaling {
                     deadlines,
                     now,
                 )? {
-                    events.push(event);
+                    outcomes.push(SignalingOutcome::event(event));
                 }
                 continue;
             };
@@ -373,14 +386,49 @@ impl UdpSignaling {
             {
                 continue;
             }
-            if deliver && let Some(event) = response_event(response)? {
+            if deliver && let Some(mut event) = response_event(response)? {
                 if let CallEvent::InviteAccepted { branch } = &event {
                     self.remember_confirmed(branch, response, dialogs)?;
                 }
-                events.push(event);
+                let media_result = self.classify_media_answer(&mut event, response);
+                let mut outcome = SignalingOutcome::event(event);
+                match media_result {
+                    Some(Ok(answer)) => outcome = outcome.with_media_answer(answer),
+                    Some(Err(error)) => outcome = outcome.with_invalid_media(error),
+                    None => {}
+                }
+                outcomes.push(outcome);
             }
         }
-        Ok(events)
+        Ok(outcomes)
+    }
+
+    fn classify_media_answer(
+        &self,
+        event: &mut CallEvent,
+        response: &ValidatedResponse,
+    ) -> Option<Result<RemoteMediaAnswer, MediaAnswerError>> {
+        let media_result = if matches!(
+            event,
+            CallEvent::Provisional { .. } | CallEvent::InviteAccepted { .. }
+        ) {
+            self.media_answer_policy.as_ref().and_then(|policy| {
+                match policy.negotiate_response(response) {
+                    Ok(Some(answer)) => Some(Ok(answer)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+        } else {
+            None
+        };
+        if let CallEvent::Provisional { has_sdp, .. } = event {
+            *has_sdp = matches!(
+                media_result.as_ref(),
+                Some(Ok(answer)) if answer.disposition() == RemoteMediaDisposition::Active
+            );
+        }
+        media_result
     }
 
     fn handle_inbound_request(
@@ -1119,7 +1167,7 @@ mod tests {
         first_tick: u64,
     ) -> Vec<CallEvent> {
         for tick in first_tick..first_tick.saturating_add(100) {
-            let events = signaling
+            let outcomes = signaling
                 .poll(
                     transactions,
                     dialogs,
@@ -1129,7 +1177,10 @@ mod tests {
                 )
                 .unwrap_or_else(|_| panic!("poll response"));
             if signaling.received != 0 {
-                return events;
+                return outcomes
+                    .into_iter()
+                    .map(|outcome| outcome.into_parts().0)
+                    .collect();
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1385,7 +1436,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(matches!(events.as_slice(), [CallEvent::Provisional { .. }]));
+        assert!(matches!(
+            events.as_slice(),
+            [outcome] if matches!(outcome.call_event(), CallEvent::Provisional { .. })
+        ));
         assert_eq!(
             signaling.observed_reflexive_addr(),
             Some(
@@ -1433,7 +1487,11 @@ mod tests {
         }
         assert!(matches!(
             events.as_slice(),
-            [CallEvent::InviteRejected { status: 486, .. }]
+            [outcome]
+                if matches!(
+                    outcome.call_event(),
+                    CallEvent::InviteRejected { status: 486, .. }
+                )
         ));
         let (length, _) = peer
             .recv_from(&mut received)
@@ -1459,8 +1517,11 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        let [CallEvent::InviteAccepted { branch }] = events.as_slice() else {
+        let [outcome] = events.as_slice() else {
             panic!("accepted branch")
+        };
+        let CallEvent::InviteAccepted { branch } = outcome.call_event() else {
+            panic!("accepted event")
         };
         signaling
             .execute_call_actions(
@@ -1564,7 +1625,7 @@ mod tests {
         }
         assert!(matches!(
             accepted.as_slice(),
-            [CallEvent::InviteAccepted { .. }]
+            [outcome] if matches!(outcome.call_event(), CallEvent::InviteAccepted { .. })
         ));
 
         let bye = format!(
@@ -1595,7 +1656,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(bye_events, vec![CallEvent::RemoteBye]);
+        assert!(matches!(
+            bye_events.as_slice(),
+            [outcome] if matches!(outcome.call_event(), CallEvent::RemoteBye)
+        ));
         let (first_response, _) = receive_request(&peer, &mut buffer);
         assert!(first_response.starts_with("SIP/2.0 200 OK\r\n"));
         assert_eq!(header_value(&first_response, "CSeq:"), "2 BYE");

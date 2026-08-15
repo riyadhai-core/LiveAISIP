@@ -30,6 +30,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use super::controller::ActiveMedia;
+use crate::media::pcmu::MAX_PCMU_PACKET_TIME_MS;
 use crate::rtp::clock::{RtpClockError, RtpClockRate};
 use crate::rtp::liveness::{MediaLiveness, MediaLivenessError};
 use crate::rtp::packet::rtcp::CompoundPolicy;
@@ -44,8 +45,6 @@ use crate::rtp::transport::symmetric::{SymmetricConfig, SymmetricEndpoints, Symm
 use crate::sip::identifier::{WireTokenError, generate_wire_token};
 use crate::sip::sdp::Direction;
 
-/// Maximum PCMU packet duration accepted by the live RTP session.
-pub const MAX_PCMU_PACKET_TIME_MS: u16 = 200;
 /// Default silence before inbound media is considered timed out.
 pub const DEFAULT_RECEIVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default silence before all media activity is considered inactive.
@@ -248,6 +247,26 @@ pub struct ActiveRtpSession {
 }
 
 impl ActiveRtpSession {
+    /// Wraps an already constructed bidirectional session for compatibility
+    /// with low-level callers that prepared transport state directly.
+    pub(crate) fn from_prebuilt(session: RtpSession) -> Result<Self, MediaSessionBuildError> {
+        let media_destination = session.remote_rtp_destination();
+        let control_destination = SocketAddr::new(
+            media_destination.ip(),
+            media_destination
+                .port()
+                .checked_add(1)
+                .ok_or(MediaSessionBuildError::ControlPortOverflow)?,
+        );
+        Ok(Self {
+            generation: 0,
+            direction: Direction::SendRecv,
+            remote_rtp: media_destination,
+            remote_rtcp: control_destination,
+            session,
+        })
+    }
+
     /// Returns the media generation that exclusively owns this state.
     #[must_use]
     pub const fn generation(&self) -> u64 {
@@ -294,6 +313,11 @@ impl ActiveRtpSession {
     #[must_use]
     pub fn send_session(&mut self) -> Option<&mut RtpSession> {
         self.can_send().then_some(&mut self.session)
+    }
+
+    /// Borrows session state for direction-neutral RTCP processing.
+    pub(crate) const fn session_mut(&mut self) -> &mut RtpSession {
+        &mut self.session
     }
 }
 

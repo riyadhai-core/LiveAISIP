@@ -17,7 +17,13 @@
 pub mod controller;
 /// Transactional negotiated RTP session generation.
 pub mod session;
+/// Bounded PCMU transmit queue and ten-millisecond packetizer.
+pub mod transmit;
 
 pub use session::{
     ActiveRtpSession, MediaSessionActivation, MediaSessionBuildError, MediaSessionPolicy,
+};
+pub use transmit::{
+    DEFAULT_PCMU_TRANSMIT_QUEUE_FRAMES, PcmuPacket, PcmuTransmit, PcmuTransmitError,
+    PcmuTransmitTick,
 };

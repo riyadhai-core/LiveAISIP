@@ -23,3 +23,5 @@
 pub mod format;
 /// Fixed-size PCM frame contracts.
 pub mod frame;
+/// Allocation-free G.711 mu-law codec.
+pub mod pcmu;

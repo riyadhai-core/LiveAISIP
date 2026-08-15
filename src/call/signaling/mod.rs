@@ -19,9 +19,14 @@ mod dialog;
 pub mod engine;
 mod error;
 mod invite;
+/// Fork-bound SDP answer validation and media negotiation.
+pub mod media;
+mod outcome;
 mod timer;
 mod wire;
 
 pub use engine::UdpSignaling;
 pub use error::SignalingError;
 pub use invite::{OutboundInviteConfig, OutboundInviteError};
+pub use media::{MediaAnswerError, MediaAnswerPolicy, RemoteMediaAnswer, RemoteMediaDisposition};
+pub use outcome::{MediaAnswerOutcome, SignalingOutcome};
