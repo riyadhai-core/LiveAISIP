@@ -25,6 +25,8 @@ pub mod receive;
 pub mod rtcp;
 /// Allocation-free outbound RTP sequence and timestamp state.
 pub mod send;
+/// Call-owned RTP serialization and UDP wire execution.
+pub mod wire;
 
 mod error;
 mod ingress;
@@ -38,6 +40,7 @@ pub use playout_ingress::{
     PCMU_20MS_PAYLOAD_BYTES, PlayoutPacket,
 };
 pub use telephone::TelephoneEventConfig;
+pub use wire::{RtpWireSendError, RtpWireSendOutcome, RtpWireSender};
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -317,6 +320,15 @@ impl RtpSession {
         if let Some(rtcp) = &mut self.rtcp {
             rtcp.note_rtp_sent(payload_octets);
         }
+    }
+
+    pub(crate) fn admit_outbound(
+        &self,
+        protection: PacketProtection,
+    ) -> Result<(), RtpSessionError> {
+        self.security
+            .admit(protection)
+            .map_err(RtpSessionError::Security)
     }
 
     /// Polls the session-owned RTCP report cadence.

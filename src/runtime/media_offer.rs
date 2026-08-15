@@ -42,7 +42,7 @@ pub enum MediaCodec {
     Pcmu,
 }
 
-/// Validated inputs from which LiveAISIP generates SDP.
+/// Validated inputs from which `LiveAISIP` generates SDP.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct MediaOfferConfig {
     codec: MediaCodec,

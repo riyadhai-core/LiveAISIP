@@ -45,7 +45,9 @@ use std::time::Duration;
 use crate::call::execution::deadline::{DeadlineId, DeadlineOwner, DeadlineScheduler};
 use crate::call::media::controller::MediaController;
 use crate::rtp::security::PacketProtection;
-use crate::rtp::session::{RtcpIngressOutcome, RtpIngressOutcome, RtpSession};
+use crate::rtp::session::{
+    RtcpIngressOutcome, RtpIngressOutcome, RtpSession, RtpWireSendOutcome, RtpWireSender,
+};
 use crate::rtp::transport::{Component, MediaPacketScratch, MediaSocketPair, SocketError};
 use crate::runtime::admission::AdmissionLeaseGroup;
 use crate::sip::auth::AuthContext;
@@ -88,6 +90,7 @@ pub struct CallRuntime {
     media_sockets: Option<MediaSocketPair>,
     packet_scratch: Option<MediaPacketScratch>,
     rtp_session: Option<RtpSession>,
+    rtp_sender: Option<RtpWireSender>,
     signaling: Option<UdpSignaling>,
     admission: AdmissionLeaseGroup,
     shutdown_grace: Duration,
@@ -135,6 +138,7 @@ impl CallRuntime {
             media_sockets: None,
             packet_scratch: None,
             rtp_session: None,
+            rtp_sender: None,
             signaling: None,
             admission,
             shutdown_grace: config.shutdown_grace,
@@ -172,6 +176,19 @@ impl CallRuntime {
             return Err(CallRuntimeError::ResourcesAlreadyInstalled);
         }
         self.rtp_session = Some(session);
+        Ok(self)
+    }
+
+    /// Installs outbound RTP sequence/timestamp and wire state before spawn.
+    ///
+    /// # Errors
+    ///
+    /// Rejects replacement or installation after ownership starts.
+    pub fn with_rtp_sender(mut self, sender: RtpWireSender) -> Result<Self, CallRuntimeError> {
+        if self.owner.is_some() || self.rtp_sender.is_some() {
+            return Err(CallRuntimeError::ResourcesAlreadyInstalled);
+        }
+        self.rtp_sender = Some(sender);
         Ok(self)
     }
 
@@ -644,6 +661,7 @@ impl CallRuntime {
         self.media.close();
         self.signaling = None;
         self.rtp_session = None;
+        self.rtp_sender = None;
         self.media_sockets = None;
         self.packet_scratch = None;
         self.admission.release_all();
@@ -711,6 +729,42 @@ impl CallRuntime {
     pub fn media_sockets(&mut self) -> Result<Option<&mut MediaSocketPair>, CallRuntimeError> {
         self.verify_owner()?;
         Ok(self.media_sockets.as_mut())
+    }
+
+    /// Encodes and transmits one clear RTP codec payload on the owner thread.
+    ///
+    /// This is the native wire effect used after codec packetization. It never
+    /// accepts an application-supplied destination and cannot bypass secure
+    /// media policy.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-owner use, incomplete media resources, secure-media
+    /// downgrade, serialization failure, or UDP send failure.
+    pub fn send_plain_rtp(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<RtpWireSendOutcome, CallRuntimeError> {
+        self.verify_owner()?;
+        let sender = self
+            .rtp_sender
+            .as_mut()
+            .ok_or(CallRuntimeError::MediaResourcesUnavailable)?;
+        let session = self
+            .rtp_session
+            .as_mut()
+            .ok_or(CallRuntimeError::MediaResourcesUnavailable)?;
+        let sockets = self
+            .media_sockets
+            .as_ref()
+            .ok_or(CallRuntimeError::MediaResourcesUnavailable)?;
+        let scratch = self
+            .packet_scratch
+            .as_mut()
+            .ok_or(CallRuntimeError::MediaResourcesUnavailable)?;
+        sender
+            .send_plain(session, sockets, scratch, payload)
+            .map_err(CallRuntimeError::RtpWire)
     }
 
     /// Returns owner-only mutable Digest challenge state.
@@ -867,6 +921,7 @@ impl fmt::Debug for CallRuntime {
             .field("media_sockets", &self.media_sockets.is_some())
             .field("packet_scratch", &self.packet_scratch.is_some())
             .field("rtp_session", &self.rtp_session.is_some())
+            .field("rtp_sender", &self.rtp_sender.is_some())
             .field("signaling", &self.signaling.is_some())
             .field("shutting_down", &self.shutting_down)
             .field("cleaned_up", &self.cleaned_up)
@@ -893,8 +948,9 @@ mod tests {
     use crate::rtp::clock::RtpClockRate;
     use crate::rtp::liveness::MediaLiveness;
     use crate::rtp::security::MediaSecurityPolicy;
-    use crate::rtp::session::RtpSession;
     use crate::rtp::session::receive::RtpReceiveConfig;
+    use crate::rtp::session::send::{RtpSendConfig, RtpSendState};
+    use crate::rtp::session::{RtpSession, RtpWireSender};
     use crate::rtp::source::SourcePolicy;
     use crate::rtp::transport::symmetric::{SymmetricConfig, SymmetricEndpoints};
     use crate::rtp::transport::{
@@ -1179,6 +1235,40 @@ mod tests {
             runtime.poll_network(Component::Rtp, Duration::ZERO),
             Err(CallRuntimeError::MediaResourcesUnavailable)
         ));
+    }
+
+    #[test]
+    fn owner_thread_executes_outbound_pcmu_rtp_on_call_owned_socket() {
+        let receiver = UdpSocket::bind(address(0)).unwrap_or_else(|_| panic!("receiver"));
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap_or_else(|_| panic!("timeout"));
+        let remote = receiver.local_addr().unwrap_or_else(|_| panic!("remote"));
+        let (_pool, sockets) = media_sockets();
+        let scratch = MediaPacketScratch::new(DEFAULT_MAX_MEDIA_DATAGRAM_BYTES)
+            .unwrap_or_else(|_| panic!("scratch"));
+        let send_config = RtpSendConfig::pcmu_20ms(7).unwrap_or_else(|_| panic!("send config"));
+        let sender = RtpWireSender::new(RtpSendState::new(send_config, 10, 20));
+        let mut runtime = runtime()
+            .with_media_sockets(sockets)
+            .and_then(|runtime| runtime.with_packet_scratch(scratch))
+            .and_then(|runtime| runtime.with_rtp_session(media_session(remote)))
+            .and_then(|runtime| runtime.with_rtp_sender(sender))
+            .unwrap_or_else(|_| panic!("resources"));
+        runtime
+            .claim_current_thread()
+            .unwrap_or_else(|_| panic!("claim"));
+        let outcome = runtime
+            .send_plain_rtp(&[0x55; 160])
+            .unwrap_or_else(|_| panic!("send"));
+        assert_eq!(outcome.sequence_number(), 10);
+        assert_eq!(outcome.timestamp(), 20);
+        let mut packet = [0_u8; 256];
+        let (length, _) = receiver
+            .recv_from(&mut packet)
+            .unwrap_or_else(|_| panic!("receive"));
+        assert_eq!(length, 172);
+        assert_eq!(&packet[12..length], &[0x55; 160]);
     }
 
     #[test]

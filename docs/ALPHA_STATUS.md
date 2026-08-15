@@ -41,7 +41,7 @@ described as production-ready elsewhere.
 | DNS NAPTR/SRV/address selection | yes | yes | no | policy only | no | no |
 | SIP TCP/TLS | yes | partial | no | framing only | no | no |
 | RTP receive | yes | yes | partial | yes | no | no |
-| RTP transmit | yes | partial | no | partial | no | no |
+| Clear RTP transmit | yes | yes | yes | yes | no | no |
 | Live RTCP | yes | yes | no | deterministic | no | no |
 | DTMF receive/transmit | yes | yes | no | deterministic | no | no |
 | SRTP/SRTCP | policy only | partial | no | downgrade policy | no | no |
