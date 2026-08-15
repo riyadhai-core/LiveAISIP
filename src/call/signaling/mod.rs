@@ -18,8 +18,10 @@ mod auth;
 mod dialog;
 pub mod engine;
 mod error;
+mod invite;
 mod timer;
 mod wire;
 
 pub use engine::UdpSignaling;
 pub use error::SignalingError;
+pub use invite::{OutboundInviteConfig, OutboundInviteError};

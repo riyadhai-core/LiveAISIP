@@ -210,6 +210,16 @@ impl CallManager {
     ///
     /// Preserves native join failure after removing the affected entry.
     pub fn reap_finished(&mut self) -> Result<usize, CallManagerError> {
+        Ok(self.reap_finished_reports()?.len())
+    }
+
+    /// Joins every terminal call and returns its privacy-safe final report.
+    ///
+    /// # Errors
+    ///
+    /// Preserves registry/output allocation and native join failures after
+    /// removing the affected call.
+    pub fn reap_finished_reports(&mut self) -> Result<Vec<CallExit>, CallManagerError> {
         let mut completed = Vec::new();
         completed
             .try_reserve(self.calls.len())
@@ -219,16 +229,18 @@ impl CallManager {
                 .iter()
                 .filter_map(|(id, handle)| handle.status().phase.is_terminal().then_some(*id)),
         );
-        let mut reaped = 0;
+        let mut exits = Vec::new();
+        exits
+            .try_reserve_exact(completed.len())
+            .map_err(|_| CallManagerError::AllocationFailed)?;
         for id in completed {
             let handle = self
                 .calls
                 .remove(&id)
                 .ok_or(CallManagerError::UnknownCall)?;
-            handle.join().map_err(CallManagerError::Thread)?;
-            reaped += 1;
+            exits.push(handle.join().map_err(CallManagerError::Thread)?);
         }
-        Ok(reaped)
+        Ok(exits)
     }
 
     /// Stops admission, requests every call to drain, clears the registry, and

@@ -77,7 +77,7 @@ pub enum SignalingError {
     MissingLocalDialogTag,
     /// No further in-dialog `CSeq` could be represented.
     SequenceExhausted,
-    /// Generated Via address was not reachable or did not match the socket port.
+    /// Generated Via address was unusable or did not match the socket family.
     InvalidAdvertisedAddress,
     /// A raw initial or challenge header could not be safely unfolded.
     HeaderNormalization(crate::sip::validation::headers::LogicalValueError),

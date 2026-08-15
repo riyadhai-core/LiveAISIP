@@ -21,5 +21,14 @@
 
 /// Bounded call/media admission and retry suppression.
 pub mod admission;
+/// Atomic preparation of outbound call runtimes.
+pub mod dial;
+/// Bounded process-level call engine.
+pub mod engine;
 /// Coordinated graceful shutdown.
 pub mod shutdown;
+
+pub use dial::{OutboundDialConfig, OutboundDialError, PreparedOutboundCall};
+pub use engine::{
+    DialedCall, RuntimeEngine, RuntimeEngineConfig, RuntimeEngineError, RuntimeShutdownProgress,
+};

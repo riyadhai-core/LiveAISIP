@@ -29,7 +29,7 @@ use crate::sip::headers::from::FromHeader;
 use crate::sip::headers::max_forwards::MaxForwards;
 use crate::sip::headers::proxy_authorization::ProxyAuthorization;
 use crate::sip::headers::to::ToHeader;
-use crate::sip::headers::via::Via;
+use crate::sip::headers::via::{RPort, Via};
 use crate::sip::identifier::generate_wire_token;
 use crate::sip::transaction::client::{
     Action as ClientAction, ClientTransaction, Timer as ClientTimer,
@@ -86,6 +86,7 @@ pub struct UdpSignaling {
     driver: UdpDriver,
     destination: Destination,
     advertised_addr: SocketAddr,
+    observed_reflexive_addr: Option<SocketAddr>,
     udp: UdpConfig,
     initial_invite: Option<ValidatedRequest>,
     template: Option<RequestTemplate>,
@@ -123,6 +124,7 @@ impl UdpSignaling {
             driver,
             destination,
             advertised_addr,
+            observed_reflexive_addr: None,
             udp,
             initial_invite: None,
             template: None,
@@ -158,18 +160,18 @@ impl UdpSignaling {
 
     /// Selects the reachable address serialized into generated Via fields.
     ///
-    /// This is required when the socket is bound to a wildcard address. The
-    /// port must be the actual bound UDP port so responses return to this
-    /// call-owned socket.
+    /// This is required when the socket is bound to a wildcard address. A
+    /// different port is valid when a stable NAT mapping forwards that
+    /// public endpoint to this call-owned socket.
     ///
     /// # Errors
     ///
-    /// Rejects an unspecified IP, port zero, or a port different from the
-    /// bound socket.
+    /// Rejects an unspecified IP, port zero, or an address family different
+    /// from the bound socket.
     pub fn with_advertised_addr(mut self, address: SocketAddr) -> Result<Self, SignalingError> {
         if address.ip().is_unspecified()
             || address.port() == 0
-            || address.port() != self.driver.local_addr().port()
+            || address.is_ipv4() != self.driver.local_addr().is_ipv4()
         {
             return Err(SignalingError::InvalidAdvertisedAddress);
         }
@@ -181,6 +183,25 @@ impl UdpSignaling {
     #[must_use]
     pub const fn advertised_addr(&self) -> SocketAddr {
         self.advertised_addr
+    }
+
+    /// Returns the public source endpoint reported in a transaction-matched
+    /// response's topmost `received` and valued `rport` parameters.
+    ///
+    /// This observation is diagnostic evidence, not an automatic Contact
+    /// rewrite: the initial INVITE Contact has already been transmitted when
+    /// the first response arrives.
+    #[must_use]
+    pub const fn observed_reflexive_addr(&self) -> Option<SocketAddr> {
+        self.observed_reflexive_addr
+    }
+
+    /// Returns whether the configured advertised endpoint agrees with the
+    /// latest transaction-matched `received`/`rport` observation.
+    #[must_use]
+    pub fn advertised_addr_matches_observation(&self) -> Option<bool> {
+        self.observed_reflexive_addr
+            .map(|observed| observed == self.advertised_addr)
     }
 
     /// Installs validated Digest credentials before the call starts.
@@ -320,6 +341,9 @@ impl UdpSignaling {
             let route = transactions
                 .route_response_at(response, now)
                 .map_err(SignalingError::Transactions)?;
+            if !matches!(&route, ClientResponseRoute::Unknown) {
+                self.observe_reflexive_addr(response);
+            }
             let deliver = match route {
                 ClientResponseRoute::Live(routed) => {
                     let (token, actions) = routed.into_parts();
@@ -934,10 +958,22 @@ impl UdpSignaling {
     fn generate_via(&mut self) -> Result<Via, SignalingError> {
         let token = generate_wire_token().map_err(SignalingError::WireToken)?;
         let via_text = format!(
-            "SIP/2.0/UDP {};branch=z9hG4bK-{token}",
+            "SIP/2.0/UDP {};rport;branch=z9hG4bK-{token}",
             self.advertised_addr
         );
         Via::from_bytes(via_text.as_bytes()).map_err(SignalingError::Via)
+    }
+
+    fn observe_reflexive_addr(&mut self, response: &ValidatedResponse) {
+        let topmost = response.core_headers().topmost_via();
+        let (Some(address), Some(RPort::Value(port))) = (topmost.received(), topmost.rport())
+        else {
+            return;
+        };
+        if address.is_unspecified() || address.is_multicast() || port == 0 {
+            return;
+        }
+        self.observed_reflexive_addr = Some(SocketAddr::new(address, port));
     }
 
     fn send(&mut self, bytes: Arc<[u8]>) -> Result<(), SignalingError> {
@@ -1009,6 +1045,14 @@ impl fmt::Debug for UdpSignaling {
         formatter
             .debug_struct("UdpSignaling")
             .field("initial_invite_installed", &self.initial_invite.is_some())
+            .field(
+                "has_reflexive_observation",
+                &self.observed_reflexive_addr.is_some(),
+            )
+            .field(
+                "advertised_matches_observation",
+                &self.advertised_addr_matches_observation(),
+            )
             .field("active_timers", &self.timers.len())
             .field("received", &self.received)
             .field("rejected", &self.rejected)
@@ -1090,6 +1134,41 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("response not processed")
+    }
+
+    #[test]
+    fn accepts_stable_nat_mapped_port_and_rejects_socket_family_mismatch() {
+        let peer = UdpSocket::bind(localhost(0)).unwrap_or_else(|_| panic!("peer"));
+        let remote = peer.local_addr().unwrap_or_else(|_| panic!("peer address"));
+        let signaling = UdpSignaling::bind(
+            localhost(0),
+            remote,
+            UdpDriverConfig::default(),
+            UdpConfig::default(),
+        )
+        .unwrap_or_else(|_| panic!("signaling"));
+        let mapped = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)), 62_000);
+        let signaling = signaling
+            .with_advertised_addr(mapped)
+            .unwrap_or_else(|_| panic!("mapped endpoint"));
+        assert_eq!(signaling.advertised_addr(), mapped);
+
+        let signaling = UdpSignaling::bind(
+            localhost(0),
+            remote,
+            UdpDriverConfig::default(),
+            UdpConfig::default(),
+        )
+        .unwrap_or_else(|_| panic!("signaling"));
+        assert!(
+            signaling
+                .with_advertised_addr(
+                    "[2001:db8::1]:62000"
+                        .parse()
+                        .unwrap_or_else(|_| panic!("address"))
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -1176,6 +1255,7 @@ mod tests {
         assert!(server_invite.contains("Subject: preserved-extension"));
         assert!(server_invite.ends_with(body));
         assert!(!server_invite.contains("never-on-wire"));
+        assert!(header_value(&server_invite, "Via:").contains(";rport;"));
         assert_ne!(
             header_value(&server_invite, "Via:"),
             header_value(&initial, "Via:")
@@ -1219,6 +1299,7 @@ mod tests {
         assert!(proxy_invite.contains("Proxy-Authorization: Digest "));
         assert!(proxy_invite.ends_with(body));
         assert!(!proxy_invite.contains("never-on-wire"));
+        assert!(header_value(&proxy_invite, "Via:").contains(";rport;"));
     }
 
     #[test]
@@ -1277,7 +1358,7 @@ mod tests {
         let response = |status: u16, reason: &str| {
             format!(
                 "SIP/2.0 {status} {reason}\r\n\
-                 Via: SIP/2.0/UDP {local};branch=z9hG4bK-wire-test\r\n\
+                 Via: SIP/2.0/UDP {local};received=198.51.100.20;rport=62000;branch=z9hG4bK-wire-test\r\n\
                  From: <sip:runtime@127.0.0.1>;tag=local-tag\r\n\
                  To: <sip:service@127.0.0.1>;tag=remote-tag\r\n\
                  Call-ID: wire-test@127.0.0.1\r\n\
@@ -1305,6 +1386,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(matches!(events.as_slice(), [CallEvent::Provisional { .. }]));
+        assert_eq!(
+            signaling.observed_reflexive_addr(),
+            Some(
+                "198.51.100.20:62000"
+                    .parse()
+                    .unwrap_or_else(|_| panic!("address"))
+            )
+        );
+        assert_eq!(signaling.advertised_addr_matches_observation(), Some(false));
         signaling
             .execute_call_actions(
                 &[CallAction::SendCancel],

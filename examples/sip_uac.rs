@@ -18,33 +18,14 @@ use std::env;
 use std::error::Error;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use liveaisip::call::execution::manager::CallManager;
-use liveaisip::call::model::context::CallContext;
-use liveaisip::call::{
-    CallAction, CallCommand, CallEvent, CallRuntime, CallRuntimeConfig, CallThreadPhase,
-    UdpSignaling,
-};
-use liveaisip::runtime::admission::AdmissionLeaseGroup;
+use liveaisip::call::CallAction;
+use liveaisip::call::execution::thread::CallThreadConfig;
+use liveaisip::runtime::{OutboundDialConfig, RuntimeEngine, RuntimeEngineConfig};
 use liveaisip::sip::auth::DigestCredentials;
-use liveaisip::sip::builder::request::RequestBuilder;
-use liveaisip::sip::headers::call_id::CallId;
-use liveaisip::sip::headers::contact::Contact;
-use liveaisip::sip::headers::content_type::ContentType;
-use liveaisip::sip::headers::cseq::CSeq;
-use liveaisip::sip::headers::from::FromHeader;
-use liveaisip::sip::headers::max_forwards::MaxForwards;
-use liveaisip::sip::headers::to::ToHeader;
-use liveaisip::sip::headers::via::Via;
-use liveaisip::sip::identifier::generate_wire_token;
-use liveaisip::sip::parser::{message, uri};
-use liveaisip::sip::transport::udp::UdpConfig;
-use liveaisip::sip::transport::udp_driver::UdpDriverConfig;
-use liveaisip::sip::types::header::HeaderKind;
-use liveaisip::sip::types::method::Method;
-use liveaisip::sip::validation;
+use liveaisip::sip::headers::retry_after::RetryAfter;
+use liveaisip::sip::parser::uri;
 
 const DEFAULT_SETUP_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -52,6 +33,7 @@ struct Config {
     destination: SocketAddr,
     bind: SocketAddr,
     advertise: Option<IpAddr>,
+    advertise_address: Option<SocketAddr>,
     from: String,
     to: String,
     username: Option<String>,
@@ -70,59 +52,53 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let config = parse_args()?;
-    let mut signaling = UdpSignaling::bind(
-        config.bind,
-        config.destination,
-        UdpDriverConfig::default(),
-        UdpConfig::default(),
-    )?;
-    let bound = signaling.local_addr();
-    let advertised = match config.advertise {
-        Some(ip) => SocketAddr::new(ip, bound.port()),
-        None if !bound.ip().is_unspecified() => bound,
-        None => {
+    let caller = uri::parse_str(&config.from)?;
+    let target = uri::parse_str(&config.to)?;
+    let mut dial = OutboundDialConfig::new(caller, target, config.bind, config.destination)?
+        .with_inactive_pcmu_sdp();
+    dial = match (config.advertise_address, config.advertise) {
+        (Some(address), None) => dial.with_advertised_addr(address)?,
+        (None, Some(ip)) => dial.with_advertised_ip(ip)?,
+        (Some(_), Some(_)) => {
             return Err(input_error(
-                "UDP route selection returned a wildcard address",
+                "--advertise and --advertise-address are mutually exclusive",
             ));
         }
+        (None, None) => dial,
     };
-    signaling = signaling.with_advertised_addr(advertised)?;
     if let (Some(username), Some(password)) = (&config.username, &config.password) {
-        signaling = signaling.with_credentials(DigestCredentials::new(
+        dial = dial.with_credentials(DigestCredentials::new(
             username.as_str(),
             password.as_str(),
         )?);
     }
-
-    let request = build_invite(&config, advertised)?;
-    signaling.install_initial_invite(request)?;
-    let context = CallContext::new(Duration::ZERO, 256)?;
-    let runtime = CallRuntime::new(
-        context,
-        AdmissionLeaseGroup::new(),
-        CallRuntimeConfig::default(),
-    )?
-    .with_udp_signaling(signaling)?;
-    let mut manager = CallManager::new(1)?;
-    let token = manager.spawn(1, runtime)?;
-    manager.submit(token, CallEvent::Command(CallCommand::Start))?;
+    let mut engine = RuntimeEngine::new(RuntimeEngineConfig::new(
+        1,
+        RetryAfter::new(3),
+        CallThreadConfig::default(),
+        Duration::from_secs(5),
+    ))?;
+    let dialed = engine.dial(1, dial, Duration::ZERO)?;
+    let token = dialed.token();
+    let bound = dialed.local_addr();
+    let advertised = dialed.advertised_addr();
 
     println!(
-        "calling {} through {} from UDP {} (Via {})",
+        "calling {} through {} from UDP {} (Via/Contact {})",
         config.to, config.destination, bound, advertised
     );
     let started = Instant::now();
     let mut established: Option<Instant> = None;
     let mut hangup_sent = false;
     loop {
-        let handle = manager.handle(token)?;
+        let handle = engine.handle(token)?;
         let status = handle.status();
         if status.phase.is_terminal() {
             break;
         }
         if established.is_none() && started.elapsed() >= config.setup_timeout {
             eprintln!("setup timeout; cancelling call");
-            manager.submit(token, CallEvent::Command(CallCommand::Hangup))?;
+            engine.hangup(token)?;
             hangup_sent = true;
         }
         if let Some(at) = established
@@ -130,11 +106,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             && at.elapsed() >= config.duration
         {
             println!("call duration elapsed; sending BYE");
-            manager.submit(token, CallEvent::Command(CallCommand::Hangup))?;
+            engine.hangup(token)?;
             hangup_sent = true;
         }
 
-        match manager.receive_actions(token, Duration::from_millis(100)) {
+        match engine.receive_actions(token, Duration::from_millis(100)) {
             Ok(Some(actions)) => {
                 for action in actions {
                     if config.verbose {
@@ -150,69 +126,35 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
             Ok(None) => {}
-            Err(_) if matches!(status.phase, CallThreadPhase::Completed) => break,
-            Err(error) => return Err(Box::new(error)),
+            Err(error) => {
+                let latest = engine.handle(token)?.status();
+                if latest.phase.is_terminal() {
+                    break;
+                }
+                return Err(Box::new(error));
+            }
         }
     }
 
-    let exit = manager.remove(token)?;
+    let exit = engine.remove(token)?;
+    let diagnostics = exit.runtime();
     println!(
-        "call thread exited {:?}; SIP datagrams processed={}, deadlines={}",
+        "call thread exited {:?}; final SIP status={:?}, messages={}, deadlines={}, reflexive_endpoint_observed={}, advertised_endpoint_mismatch={}",
         exit.kind(),
-        exit.runtime().processed_messages,
-        exit.runtime().processed_deadlines
+        diagnostics.last_sip_status,
+        diagnostics.processed_messages,
+        diagnostics.processed_deadlines,
+        diagnostics.signaling_reflexive_endpoint_observed,
+        diagnostics.signaling_advertised_endpoint_mismatch,
     );
     Ok(())
-}
-
-fn build_invite(
-    config: &Config,
-    advertised: SocketAddr,
-) -> Result<validation::request::ValidatedRequest, Box<dyn Error>> {
-    let request_uri = uri::parse_str(&config.to)?;
-    if !request_uri.is_sip() {
-        return Err(input_error("--to must be a sip: or sips: URI"));
-    }
-    let tag = generate_wire_token()?;
-    let call_token = generate_wire_token()?;
-    let branch = generate_wire_token()?;
-    let from = FromHeader::from_bytes(format!("<{}>;tag={tag}", config.from).as_bytes())?;
-    let to = ToHeader::from_bytes(format!("<{}>", config.to).as_bytes())?;
-    let call_id = CallId::new(format!("{call_token}@{}", advertised.ip()))?;
-    let cseq = CSeq::new(1, Method::Invite)?;
-    let via =
-        Via::from_bytes(format!("SIP/2.0/UDP {advertised};branch=z9hG4bK-{branch}").as_bytes())?;
-    let contact = Contact::from_bytes(format!("<sip:liveaisip@{advertised}>").as_bytes())?;
-    let mut builder = RequestBuilder::new(
-        Method::Invite,
-        request_uri,
-        &via,
-        &from,
-        &to,
-        &call_id,
-        &cseq,
-        MaxForwards::new(70),
-    )?;
-    builder.push_typed(HeaderKind::Contact, &contact)?;
-    let address_type = if advertised.is_ipv4() { "IP4" } else { "IP6" };
-    let session_id = u64::from_str_radix(&call_token[..16], 16)?;
-    let sdp = format!(
-        "v=0\r\no=liveaisip {session_id} {session_id} IN {address_type} {}\r\n\
-         s=LiveAISIP signaling-only call\r\nc=IN {address_type} {}\r\nt=0 0\r\n\
-         m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=inactive\r\n",
-        advertised.ip(),
-        advertised.ip()
-    );
-    let builder = builder.with_body(&ContentType::application_sdp(), sdp.as_bytes())?;
-    let bytes = builder.build().serialize()?;
-    let raw = message::parse(Arc::from(bytes.into_boxed_slice()))?;
-    Ok(validation::request::validate(raw)?)
 }
 
 fn parse_args() -> Result<Config, Box<dyn Error>> {
     let mut destination = None;
     let mut bind = "0.0.0.0:0".parse::<SocketAddr>()?;
     let mut advertise = None;
+    let mut advertise_address = None;
     let mut from = None;
     let mut to = None;
     let mut username = None;
@@ -240,6 +182,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
             "--destination" => destination = Some(value.parse()?),
             "--bind" => bind = value.parse()?,
             "--advertise" => advertise = Some(value.parse()?),
+            "--advertise-address" => advertise_address = Some(value.parse()?),
             "--from" => from = Some(value.clone()),
             "--to" => to = Some(value.clone()),
             "--username" => username = Some(value.clone()),
@@ -260,6 +203,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         destination: destination.ok_or_else(|| input_error("--destination is required"))?,
         bind,
         advertise,
+        advertise_address,
         from: from.ok_or_else(|| input_error("--from is required"))?,
         to: to.ok_or_else(|| input_error("--to is required"))?,
         username,
@@ -276,6 +220,6 @@ fn input_error(message: &str) -> Box<dyn Error> {
 
 fn print_usage() {
     println!(
-        "Usage: cargo run --example sip_uac -- \\\n  --destination 127.0.0.1:5060 \\\n  --bind 0.0.0.0:0 --advertise 192.0.2.10 \\\n  --from sip:liveaisip@192.0.2.10 --to sip:1000@127.0.0.1 \\\n  [--username USER --password-env ENV] [--duration 5] \\\n  [--setup-timeout 45] [--verbose]"
+        "Usage: cargo run --example sip_uac -- \\\n  --destination 127.0.0.1:5060 \\\n  --bind 0.0.0.0:0 [--advertise 192.0.2.10 | --advertise-address 192.0.2.10:5060] \\\n  --from sip:liveaisip@192.0.2.10 --to sip:1000@127.0.0.1 \\\n  [--username USER --password-env ENV] [--duration 5] \\\n  [--setup-timeout 45] [--verbose]"
     );
 }

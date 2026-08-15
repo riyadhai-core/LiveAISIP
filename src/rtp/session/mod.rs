@@ -23,342 +23,40 @@
 pub mod receive;
 /// Call-owned RTCP scheduling and report construction.
 pub mod rtcp;
+/// Allocation-free outbound RTP sequence and timestamp state.
+pub mod send;
 
-use std::error::Error as StdError;
+mod error;
+mod ingress;
+mod neteq;
+mod telephone;
+
+pub use error::RtpSessionError;
+pub use ingress::{RtcpIngressOutcome, RtpIngressOutcome};
+pub use neteq::{
+    DEFAULT_INGRESS_QUEUE_PACKETS, DEFAULT_NETEQ_PAYLOAD_BYTES, MAX_NETEQ_PACKET_POOL_BYTES,
+    NetEqPacket,
+};
+pub use telephone::TelephoneEventConfig;
+
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use self::receive::{
-    AuxiliaryPacketOutcome, ReceivePacketOutcome, RtpReceiveConfig, RtpReceiveState, RtpStateError,
-};
-use self::rtcp::{RtcpScheduleConfig, RtcpScheduler, RtcpSchedulerError, ScheduledReport};
-use super::dtmf::{TelephoneEvent, TelephoneEventError};
-use super::liveness::{MediaLiveness, MediaLivenessError};
-use super::packet::rtcp::{CompoundPolicy, CompoundRtcp, CompoundRtcpError, Goodbye, RtcpPacket};
-use super::packet::rtp::{MAX_RTP_PACKET_BYTES, RtpPacket, RtpPacketError};
-use super::queue::{BoundedQueue, OverflowPolicy, PushOutcome, QueueDiagnostics, QueueError};
-use super::security::{MediaSecurityError, MediaSecurityPolicy, PacketProtection};
+use self::neteq::NetEqPacketPool;
+use self::receive::{RtpReceiveConfig, RtpReceiveState};
+use self::rtcp::{RtcpScheduleConfig, RtcpScheduler, ScheduledReport};
+use super::dtmf::TelephoneEvent;
+use super::liveness::MediaLiveness;
+use super::packet::rtcp::{CompoundPolicy, CompoundRtcp, Goodbye, RtcpPacket};
+use super::packet::rtp::RtpPacket;
+use super::queue::{BoundedQueue, OverflowPolicy, PushOutcome, QueueDiagnostics};
+use super::security::{MediaSecurityPolicy, PacketProtection};
 use super::source::{RemoteSourceTracker, SourceObservation, SourcePolicy};
 use super::stats::reorder::{DelayedLossSnapshot, DelayedLossTracker};
 use super::transport::socket::Component;
-use super::transport::symmetric::{SymmetricEndpoints, SymmetricError, SymmetricObservation};
+use super::transport::symmetric::SymmetricEndpoints;
 use super::transport::udp::{DatagramClassification, DatagramClassifier};
-
-/// Default packets waiting for immediate `NetEq` insertion.
-pub const DEFAULT_INGRESS_QUEUE_PACKETS: usize = 128;
-/// Default encoded payload storage reserved for every `NetEq` ingress slot.
-pub const DEFAULT_NETEQ_PAYLOAD_BYTES: usize = 2_048;
-/// Hard per-session byte ceiling for preallocated encoded packet slots.
-pub const MAX_NETEQ_PACKET_POOL_BYTES: usize = 4 * 1_024 * 1_024;
-
-/// Negotiated RFC 4733 stream descriptor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TelephoneEventConfig {
-    payload_type: u8,
-    clock_rate: u32,
-    allowed_events: [u64; 4],
-}
-
-impl TelephoneEventConfig {
-    /// Creates the common keypad event set 0 through 15.
-    ///
-    /// # Errors
-    ///
-    /// Rejects invalid payload types or a zero RTP clock rate.
-    pub const fn standard(payload_type: u8, clock_rate: u32) -> Result<Self, RtpSessionError> {
-        if payload_type > 127 || clock_rate == 0 {
-            return Err(RtpSessionError::InvalidTelephoneEventConfig);
-        }
-        Ok(Self {
-            payload_type,
-            clock_rate,
-            allowed_events: [0xffff, 0, 0, 0],
-        })
-    }
-
-    /// Creates an event descriptor from a negotiated 256-bit allow set.
-    ///
-    /// # Errors
-    ///
-    /// Rejects invalid payload types, a zero clock rate, or an empty event set.
-    pub const fn new(
-        payload_type: u8,
-        clock_rate: u32,
-        allowed_events: [u64; 4],
-    ) -> Result<Self, RtpSessionError> {
-        if payload_type > 127
-            || clock_rate == 0
-            || (allowed_events[0] | allowed_events[1] | allowed_events[2] | allowed_events[3]) == 0
-        {
-            return Err(RtpSessionError::InvalidTelephoneEventConfig);
-        }
-        Ok(Self {
-            payload_type,
-            clock_rate,
-            allowed_events,
-        })
-    }
-
-    /// Returns negotiated dynamic payload type.
-    #[must_use]
-    pub const fn payload_type(self) -> u8 {
-        self.payload_type
-    }
-
-    /// Returns negotiated event timestamp clock.
-    #[must_use]
-    pub const fn clock_rate(self) -> u32 {
-        self.clock_rate
-    }
-
-    /// Returns whether one event code was negotiated.
-    #[must_use]
-    pub const fn allows(self, event: u8) -> bool {
-        let word = event as usize / 64;
-        let bit = event as usize % 64;
-        self.allowed_events[word] & (1_u64 << bit) != 0
-    }
-}
-
-struct NetEqPacketSlot {
-    sequence_number: u16,
-    timestamp: u32,
-    ssrc: u32,
-    payload_type: u8,
-    marker: bool,
-    payload_length: usize,
-    occupied: bool,
-}
-
-struct NetEqPacketPool {
-    slots: Vec<NetEqPacketSlot>,
-    payloads: Box<[u8]>,
-    free: Vec<usize>,
-    maximum_payload_bytes: usize,
-}
-
-impl NetEqPacketPool {
-    fn new(queue_capacity: usize, maximum_payload_bytes: usize) -> Result<Self, RtpSessionError> {
-        if maximum_payload_bytes == 0 || maximum_payload_bytes > MAX_RTP_PACKET_BYTES {
-            return Err(RtpSessionError::InvalidPayloadLimit {
-                value: maximum_payload_bytes,
-                maximum: MAX_RTP_PACKET_BYTES,
-            });
-        }
-        let slot_count = queue_capacity
-            .checked_add(1)
-            .ok_or(RtpSessionError::AllocationFailed)?;
-        let pool_bytes = slot_count
-            .checked_mul(maximum_payload_bytes)
-            .ok_or(RtpSessionError::AllocationFailed)?;
-        if pool_bytes > MAX_NETEQ_PACKET_POOL_BYTES {
-            return Err(RtpSessionError::PacketPoolTooLarge {
-                requested: pool_bytes,
-                maximum: MAX_NETEQ_PACKET_POOL_BYTES,
-            });
-        }
-        let mut slots = Vec::new();
-        slots
-            .try_reserve_exact(slot_count)
-            .map_err(|_| RtpSessionError::AllocationFailed)?;
-        for _ in 0..slot_count {
-            slots.push(NetEqPacketSlot {
-                sequence_number: 0,
-                timestamp: 0,
-                ssrc: 0,
-                payload_type: 0,
-                marker: false,
-                payload_length: 0,
-                occupied: false,
-            });
-        }
-        let mut payloads = Vec::new();
-        payloads
-            .try_reserve_exact(pool_bytes)
-            .map_err(|_| RtpSessionError::AllocationFailed)?;
-        payloads.resize(pool_bytes, 0);
-        let mut free = Vec::new();
-        free.try_reserve_exact(slot_count)
-            .map_err(|_| RtpSessionError::AllocationFailed)?;
-        free.extend((0..slot_count).rev());
-        Ok(Self {
-            slots,
-            payloads: payloads.into_boxed_slice(),
-            free,
-            maximum_payload_bytes,
-        })
-    }
-
-    fn store(&mut self, packet: &RtpPacket<'_>) -> Result<usize, RtpSessionError> {
-        if packet.payload().len() > self.maximum_payload_bytes {
-            return Err(RtpSessionError::PayloadTooLarge {
-                actual: packet.payload().len(),
-                maximum: self.maximum_payload_bytes,
-            });
-        }
-        let index = self
-            .free
-            .pop()
-            .ok_or(RtpSessionError::PacketPoolExhausted)?;
-        let slot = &mut self.slots[index];
-        if slot.occupied {
-            return Err(RtpSessionError::PacketPoolExhausted);
-        }
-        let header = packet.header();
-        slot.sequence_number = header.sequence_number();
-        slot.timestamp = header.timestamp();
-        slot.ssrc = header.ssrc();
-        slot.payload_type = header.payload_type();
-        slot.marker = header.marker();
-        let payload_start = index * self.maximum_payload_bytes;
-        let payload_end = payload_start + packet.payload().len();
-        self.payloads[payload_start..payload_end].copy_from_slice(packet.payload());
-        slot.payload_length = packet.payload().len();
-        slot.occupied = true;
-        Ok(index)
-    }
-
-    fn release(&mut self, index: usize) {
-        let Some(slot) = self.slots.get_mut(index) else {
-            return;
-        };
-        if !slot.occupied {
-            return;
-        }
-        slot.payload_length = 0;
-        slot.occupied = false;
-        self.free.push(index);
-    }
-
-    fn packet(&mut self, index: usize) -> Option<NetEqPacket<'_>> {
-        self.slots
-            .get(index)
-            .is_some_and(|slot| slot.occupied)
-            .then_some(NetEqPacket { pool: self, index })
-    }
-}
-
-/// Borrowed checkout of one preallocated packet slot admitted for `NetEq`.
-///
-/// Dropping this value immediately returns its storage to the owning session.
-/// Keeping it alive deliberately keeps the session mutably borrowed, so the
-/// receive loop cannot overwrite the payload before `NetEq::InsertPacket`.
-pub struct NetEqPacket<'a> {
-    pool: &'a mut NetEqPacketPool,
-    index: usize,
-}
-
-impl NetEqPacket<'_> {
-    fn slot(&self) -> &NetEqPacketSlot {
-        &self.pool.slots[self.index]
-    }
-
-    /// Returns RTP sequence number.
-    #[must_use]
-    pub fn sequence_number(&self) -> u16 {
-        self.slot().sequence_number
-    }
-
-    /// Returns RTP timestamp.
-    #[must_use]
-    pub fn timestamp(&self) -> u32 {
-        self.slot().timestamp
-    }
-
-    /// Returns synchronization source.
-    #[must_use]
-    pub fn ssrc(&self) -> u32 {
-        self.slot().ssrc
-    }
-
-    /// Returns negotiated wire payload type.
-    #[must_use]
-    pub fn payload_type(&self) -> u8 {
-        self.slot().payload_type
-    }
-
-    /// Returns RTP marker bit.
-    #[must_use]
-    pub fn marker(&self) -> bool {
-        self.slot().marker
-    }
-
-    /// Returns encoded codec payload.
-    #[must_use]
-    pub fn payload(&self) -> &[u8] {
-        let slot = self.slot();
-        let payload_start = self.index * self.pool.maximum_payload_bytes;
-        &self.pool.payloads[payload_start..payload_start + slot.payload_length]
-    }
-}
-
-impl Drop for NetEqPacket<'_> {
-    fn drop(&mut self) {
-        self.pool.release(self.index);
-    }
-}
-
-impl fmt::Debug for NetEqPacket<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let slot = self.slot();
-        formatter
-            .debug_struct("NetEqPacket")
-            .field("payload_type", &slot.payload_type)
-            .field("marker", &slot.marker)
-            .field("payload_bytes", &slot.payload_length)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Result of one RTP datagram at the session boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RtpIngressOutcome {
-    /// Datagram was not RTP-family media.
-    ClassifiedOut(DatagramClassification),
-    /// Packet is waiting for SSRC probation.
-    SourceProbation,
-    /// Packet attempted an unauthorized SSRC switch.
-    SourceRejected,
-    /// Source switched; downstream source-specific state must reset.
-    SourceSwitched,
-    /// Packet failed payload, SSRC or sequence admission.
-    StreamRejected(ReceivePacketOutcome),
-    /// Negotiated auxiliary payload failed shared source/sequence admission.
-    AuxiliaryRejected(AuxiliaryPacketOutcome),
-    /// Packet entered the bounded `NetEq` queue.
-    Queued {
-        /// Symmetric endpoint observation after stream validation.
-        endpoint: SymmetricObservation,
-    },
-    /// Packet was valid but the full ingress queue dropped it.
-    QueueDropped,
-    /// Negotiated telephone-event was parsed outside the audio/NetEq path.
-    TelephoneEvent {
-        /// Exact RFC 4733 payload.
-        event: TelephoneEvent,
-        /// Symmetric endpoint observation after authentication and source validation.
-        endpoint: SymmetricObservation,
-    },
-}
-
-/// Result of one RTCP datagram at the session boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RtcpIngressOutcome {
-    /// Datagram was not RTCP-family control traffic.
-    ClassifiedOut(DatagramClassification),
-    /// Primary RTCP source did not match the active RTP source.
-    SourceRejected,
-    /// Valid control packets updated session state.
-    Accepted {
-        /// Symmetric RTCP endpoint observation.
-        endpoint: SymmetricObservation,
-        /// Number of packets in the compound datagram.
-        packet_count: usize,
-        /// Whether a Sender Report refreshed LSR/DLSR timing.
-        sender_report: bool,
-    },
-}
 
 /// One owned receive session with no shared mutable state.
 pub struct RtpSession {
@@ -713,90 +411,6 @@ impl fmt::Debug for RtpSession {
             .field("source_resets", &self.source_resets)
             .field("rtcp_configured", &self.rtcp.is_some())
             .finish_non_exhaustive()
-    }
-}
-
-/// RTP session admission failure.
-#[derive(Debug)]
-pub enum RtpSessionError {
-    /// Security policy rejected packet protection.
-    Security(MediaSecurityError),
-    /// RTP framing was invalid.
-    Packet(RtpPacketError),
-    /// Stream state rejected an operation.
-    ReceiveState(RtpStateError),
-    /// Symmetric endpoint state rejected network source.
-    Endpoint(SymmetricError),
-    /// Media liveness clock rejected timestamp.
-    Liveness(MediaLivenessError),
-    /// Queue could not be configured.
-    Queue(QueueError),
-    /// Compound RTCP parsing or negotiated-policy validation failed.
-    CompoundRtcp(CompoundRtcpError),
-    /// RTCP scheduling or packet construction failed.
-    Rtcp(RtcpSchedulerError),
-    /// RTCP was used before session configuration.
-    RtcpNotConfigured,
-    /// Telephone-event mapping conflicted with negotiated audio.
-    InvalidTelephoneEventConfig,
-    /// RFC 4733 payload syntax was invalid.
-    Dtmf(TelephoneEventError),
-    /// Event code was not present in negotiated SDP `fmtp`.
-    TelephoneEventNotNegotiated,
-    /// Configured preallocated payload limit was invalid.
-    InvalidPayloadLimit {
-        /// Rejected payload bound.
-        value: usize,
-        /// Absolute RTP packet ceiling.
-        maximum: usize,
-    },
-    /// Encoded RTP payload exceeded its negotiated/preallocated slot.
-    PayloadTooLarge {
-        /// Received encoded payload bytes.
-        actual: usize,
-        /// Configured maximum encoded payload bytes.
-        maximum: usize,
-    },
-    /// Internal queue/pool ownership invariant was exhausted.
-    PacketPoolExhausted,
-    /// Queue capacity multiplied by slot size exceeded per-session memory policy.
-    PacketPoolTooLarge {
-        /// Requested preallocated bytes.
-        requested: usize,
-        /// Hard per-session preallocation ceiling.
-        maximum: usize,
-    },
-    /// Packet-pool setup allocation failed.
-    AllocationFailed,
-}
-
-impl fmt::Display for RtpSessionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("RTP session processing failed")
-    }
-}
-
-impl StdError for RtpSessionError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Security(error) => Some(error),
-            Self::Packet(error) => Some(error),
-            Self::ReceiveState(error) => Some(error),
-            Self::Endpoint(error) => Some(error),
-            Self::Liveness(error) => Some(error),
-            Self::Queue(error) => Some(error),
-            Self::CompoundRtcp(error) => Some(error),
-            Self::Rtcp(error) => Some(error),
-            Self::Dtmf(error) => Some(error),
-            Self::AllocationFailed
-            | Self::InvalidPayloadLimit { .. }
-            | Self::PayloadTooLarge { .. }
-            | Self::PacketPoolExhausted
-            | Self::PacketPoolTooLarge { .. }
-            | Self::RtcpNotConfigured
-            | Self::InvalidTelephoneEventConfig
-            | Self::TelephoneEventNotNegotiated => None,
-        }
     }
 }
 

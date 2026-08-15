@@ -23,48 +23,46 @@
 //! testable. [`super::thread::CallThread`] claims it once, then every mutating
 //! method verifies the native owner thread before touching protocol state.
 
-use std::error::Error as StdError;
+mod config;
+mod diagnostics;
+mod error;
+mod message;
+
+pub use config::{
+    CallRuntimeConfig, DEFAULT_CALL_DEADLINE_CAPACITY, DEFAULT_CALL_DIALOG_CAPACITY,
+    DEFAULT_CALL_SHUTDOWN_GRACE, DEFAULT_CALL_TRANSACTION_CAPACITY,
+};
+pub use diagnostics::CallRuntimeDiagnostics;
+pub use error::CallRuntimeError;
+pub use message::{AudioDirection, CallMessage};
+
 use std::fmt;
 use std::io;
 use std::net::UdpSocket;
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
-use crate::call::execution::deadline::{
-    DeadlineError, DeadlineId, DeadlineOwner, DeadlineScheduler,
-};
+use crate::call::execution::deadline::{DeadlineId, DeadlineOwner, DeadlineScheduler};
 use crate::call::media::controller::MediaController;
 use crate::rtp::security::PacketProtection;
 use crate::rtp::session::{RtcpIngressOutcome, RtpIngressOutcome, RtpSession};
 use crate::rtp::transport::{Component, MediaPacketScratch, MediaSocketPair, SocketError};
 use crate::runtime::admission::AdmissionLeaseGroup;
 use crate::sip::auth::AuthContext;
-use crate::sip::dialog::{
-    DialogManager, DialogManagerError, PrackTracker, SessionTimer, SessionTimerAction,
-};
-use crate::sip::transaction::manager::{
-    ManagerError as TransactionManagerError, TransactionManager,
-};
+use crate::sip::dialog::{DialogManager, PrackTracker, SessionTimer, SessionTimerAction};
+use crate::sip::transaction::manager::TransactionManager;
 use crate::sip::transport::failover::FailoverPlan;
 use crate::util::time::{advance_periodic, checked_deadline, minimum_deadline};
 
-use crate::call::model::context::{CallContext, CallContextError};
+use crate::call::model::context::CallContext;
 use crate::call::model::events::{CallAction, CallCommand, CallEvent};
-use crate::call::model::redirect::{RedirectError, RedirectHandler, RedirectPolicy};
+use crate::call::model::redirect::RedirectHandler;
 use crate::call::model::state::{CallEndReason, CallState};
 use crate::call::model::transfer::TransferTracker;
-use crate::call::signaling::{SignalingError, UdpSignaling};
+use crate::call::signaling::UdpSignaling;
 
 use super::timer::CallTimer;
 
-/// Default per-call SIP transaction capacity.
-pub const DEFAULT_CALL_TRANSACTION_CAPACITY: usize = 128;
-/// Default per-call SIP dialog/fork capacity.
-pub const DEFAULT_CALL_DIALOG_CAPACITY: usize = 32;
-/// Default active deadline capacity per call.
-pub const DEFAULT_CALL_DEADLINE_CAPACITY: usize = 256;
-/// Default graceful protocol cleanup interval.
-pub const DEFAULT_CALL_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// Native media cadence.
 pub const MEDIA_TICK_INTERVAL: Duration = Duration::from_millis(10);
 /// Maximum media ticks executed in one scheduling cycle.
@@ -73,121 +71,6 @@ pub const MAX_MEDIA_TICKS_PER_CYCLE: u64 = 8;
 pub const MAX_DUE_DEADLINES_PER_CYCLE: usize = 64;
 /// Maximum media datagrams consumed for one readiness notification.
 pub const MAX_MEDIA_DATAGRAMS_PER_POLL: usize = 64;
-/// Immutable capacities and teardown policy for one call runtime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CallRuntimeConfig {
-    transaction_capacity: usize,
-    dialog_capacity: usize,
-    deadline_capacity: usize,
-    shutdown_grace: Duration,
-    require_secure_media: bool,
-    redirect_policy: RedirectPolicy,
-}
-
-impl CallRuntimeConfig {
-    /// Creates explicit per-call ownership capacities.
-    #[must_use]
-    pub const fn new(
-        transaction_capacity: usize,
-        dialog_capacity: usize,
-        deadline_capacity: usize,
-        shutdown_grace: Duration,
-        require_secure_media: bool,
-    ) -> Self {
-        Self {
-            transaction_capacity,
-            dialog_capacity,
-            deadline_capacity,
-            shutdown_grace,
-            require_secure_media,
-            redirect_policy: RedirectPolicy::Reject,
-        }
-    }
-
-    /// Selects the bounded per-call 3xx policy before runtime construction.
-    #[must_use]
-    pub const fn with_redirect_policy(mut self, policy: RedirectPolicy) -> Self {
-        self.redirect_policy = policy;
-        self
-    }
-
-    /// Returns the graceful cleanup interval.
-    #[must_use]
-    pub const fn shutdown_grace(self) -> Duration {
-        self.shutdown_grace
-    }
-}
-
-impl Default for CallRuntimeConfig {
-    fn default() -> Self {
-        Self::new(
-            DEFAULT_CALL_TRANSACTION_CAPACITY,
-            DEFAULT_CALL_DIALOG_CAPACITY,
-            DEFAULT_CALL_DEADLINE_CAPACITY,
-            DEFAULT_CALL_SHUTDOWN_GRACE,
-            false,
-        )
-    }
-}
-
-/// Direction of one native/Python audio readiness notification.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AudioDirection {
-    /// Audio produced by native receive processing for Python.
-    Receive,
-    /// Audio produced by Python for native packetization.
-    Transmit,
-}
-
-/// Bounded mailbox message entering a call thread.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum CallMessage {
-    /// Serialized SIP, control, timeout, or call-lifecycle event.
-    Event(CallEvent),
-    /// RTP or RTCP socket readiness notification.
-    NetworkReady(Component),
-    /// Call-owned SIP signaling socket is readable.
-    SignalingReady,
-    /// Generation-fenced native audio queue notification.
-    AudioReady {
-        /// Media generation attached by the producer.
-        generation: u64,
-        /// Receive or transmit queue direction.
-        direction: AudioDirection,
-    },
-    /// Idempotent runtime shutdown request.
-    Shutdown,
-    #[cfg(test)]
-    /// Test-only unexpected panic injection for containment verification.
-    PanicForContainmentTest,
-}
-
-/// Privacy-safe counters owned and published by the call thread.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CallRuntimeDiagnostics {
-    /// Messages processed on the owner thread.
-    pub processed_messages: u64,
-    /// Due protocol deadlines processed.
-    pub processed_deadlines: u64,
-    /// Ten-millisecond media ticks executed.
-    pub media_ticks: u64,
-    /// Media ticks skipped after a late wakeup.
-    pub skipped_media_ticks: u64,
-    /// Stale generation-fenced audio notifications rejected.
-    pub stale_media_work: u64,
-    /// RTP and RTCP datagrams removed from call-owned sockets.
-    pub media_datagrams_received: u64,
-    /// Oversized, malformed, unauthenticated, or stream-invalid media datagrams.
-    pub media_datagrams_rejected: u64,
-    /// Audio RTP packets admitted to the bounded `NetEq` ingress queue.
-    pub rtp_audio_packets_queued: u64,
-    /// Negotiated RFC 4733 packets handled outside the audio decoder path.
-    pub dtmf_packets_received: u64,
-    /// Valid compound RTCP datagrams admitted to session state.
-    pub rtcp_packets_accepted: u64,
-}
-
 /// All mutable state associated with exactly one active call.
 pub struct CallRuntime {
     owner: Option<ThreadId>,
@@ -402,6 +285,7 @@ impl CallRuntime {
                     .context
                     .handle(event, now)
                     .map_err(CallRuntimeError::Context)?;
+                self.diagnostics.last_sip_status = self.context.lifecycle().last_sip_status();
                 if let Some(signaling) = self.signaling.as_mut() {
                     if actions
                         .iter()
@@ -566,12 +450,17 @@ impl CallRuntime {
                 now,
             )
             .map_err(CallRuntimeError::Signaling)?;
+        self.diagnostics.signaling_reflexive_endpoint_observed =
+            signaling.observed_reflexive_addr().is_some();
+        self.diagnostics.signaling_advertised_endpoint_mismatch =
+            signaling.advertised_addr_matches_observation() == Some(false);
         let mut actions = Vec::new();
         for event in events {
             let produced = self
                 .context
                 .handle(event, now)
                 .map_err(CallRuntimeError::Context)?;
+            self.diagnostics.last_sip_status = self.context.lifecycle().last_sip_status();
             signaling
                 .execute_call_actions(
                     &produced,
@@ -986,86 +875,6 @@ impl fmt::Debug for CallRuntime {
     }
 }
 
-/// Call runtime construction, ownership, or processing failure.
-#[derive(Debug)]
-pub enum CallRuntimeError {
-    /// A different native thread attempted mutable access.
-    WrongOwnerThread,
-    /// Graceful shutdown interval was zero.
-    ZeroShutdownGrace,
-    /// Call-local resources were installed twice or after ownership started.
-    ResourcesAlreadyInstalled,
-    /// Absolute monotonic calculation overflowed.
-    TimeOverflow,
-    /// SIP transaction registry construction failed.
-    Transactions(TransactionManagerError),
-    /// SIP dialog registry construction failed.
-    Dialogs(DialogManagerError),
-    /// Redirect policy allocation or validation failed.
-    Redirect(RedirectError),
-    /// Deadline scheduler operation failed.
-    Deadlines(DeadlineError),
-    /// Deterministic call context rejected an event.
-    Context(CallContextError),
-    /// RTP readiness arrived before its complete call-owned resource set.
-    MediaResourcesUnavailable,
-    /// Fatal call-owned RTP or RTCP socket operation failed.
-    MediaSocket(SocketError),
-    /// SIP action required a call-owned signaling driver that was not installed.
-    SignalingUnavailable,
-    /// Call-owned SIP transport, transaction, or timer execution failed.
-    Signaling(SignalingError),
-    /// A due deadline owner had no installed exhaustive executor.
-    UnsupportedDeadlineOwner(DeadlineOwner),
-    /// A due deadline kind was not defined for its owner.
-    UnknownDeadlineKind {
-        /// Deadline owner.
-        owner: DeadlineOwner,
-        /// Unrecognized low-cardinality kind.
-        kind: u16,
-    },
-    /// Session-refresh work was scheduled without negotiated timer state.
-    SessionTimerUnavailable,
-    /// Session refresh became due before its wire executor was installed.
-    SessionRefreshExecutorUnavailable,
-    /// Session timer work was scheduled before the negotiated instant.
-    PrematureSessionDeadline,
-    /// Transfer expiry was scheduled without an active transfer tracker.
-    TransferUnavailable,
-}
-
-impl fmt::Display for CallRuntimeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("call runtime operation failed")
-    }
-}
-
-impl StdError for CallRuntimeError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Transactions(source) => Some(source),
-            Self::Dialogs(source) => Some(source),
-            Self::Redirect(source) => Some(source),
-            Self::Deadlines(source) => Some(source),
-            Self::Context(source) => Some(source),
-            Self::MediaSocket(source) => Some(source),
-            Self::Signaling(source) => Some(source),
-            Self::WrongOwnerThread
-            | Self::ZeroShutdownGrace
-            | Self::ResourcesAlreadyInstalled
-            | Self::TimeOverflow
-            | Self::MediaResourcesUnavailable
-            | Self::SignalingUnavailable
-            | Self::UnsupportedDeadlineOwner(_)
-            | Self::UnknownDeadlineKind { .. }
-            | Self::SessionTimerUnavailable
-            | Self::SessionRefreshExecutorUnavailable
-            | Self::PrematureSessionDeadline
-            | Self::TransferUnavailable => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -1408,11 +1217,17 @@ mod tests {
                 .is_ok_and(|written| written == 2)
         );
 
-        assert!(
-            runtime
-                .poll_network(Component::Rtp, Duration::from_millis(30))
-                .is_ok()
-        );
+        for _ in 0..100 {
+            assert!(
+                runtime
+                    .poll_network(Component::Rtp, Duration::from_millis(30))
+                    .is_ok()
+            );
+            if runtime.diagnostics().media_datagrams_received == 4 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let diagnostics = runtime.diagnostics();
         assert_eq!(diagnostics.media_datagrams_received, 4);
         assert!(diagnostics.rtp_audio_packets_queued >= 1);

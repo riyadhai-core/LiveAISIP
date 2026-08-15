@@ -40,4 +40,4 @@ pub use model::state::{CallEndReason, CallState};
 pub use model::transfer::{
     TransferError, TransferNotification, TransferRequestHeaders, TransferState, TransferTracker,
 };
-pub use signaling::{SignalingError, UdpSignaling};
+pub use signaling::{OutboundInviteConfig, OutboundInviteError, SignalingError, UdpSignaling};
