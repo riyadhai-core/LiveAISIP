@@ -14,6 +14,12 @@
 
 //! Call-owned live SIP signaling composition.
 
+mod auth;
+mod dialog;
 pub mod engine;
+mod error;
+mod timer;
+mod wire;
 
-pub use engine::{SignalingError, UdpSignaling};
+pub use engine::UdpSignaling;
+pub use error::SignalingError;
