@@ -203,6 +203,36 @@ impl TransactionManager {
         Ok(token)
     }
 
+    /// Starts and registers one client transaction as an atomic owner action.
+    ///
+    /// Starting occurs only after admission and map allocation have been
+    /// proven possible. The returned token must fence every emitted timer
+    /// action before any initial send is executed by the transport owner.
+    ///
+    /// # Errors
+    ///
+    /// Rejects shutdown, duplicate keys, capacity/allocation failure, or a
+    /// transaction that had already been started.
+    pub fn start_client(
+        &mut self,
+        mut transaction: ClientTransaction,
+    ) -> Result<RoutedActions<ClientAction>, ManagerError> {
+        self.admit(transaction.key(), Role::Client)?;
+        self.clients
+            .try_reserve(1)
+            .map_err(|_| ManagerError::AllocationFailed)?;
+        let token = self.token(transaction.key().clone(), Role::Client)?;
+        let actions = transaction.start().map_err(ManagerError::Client)?;
+        self.clients.insert(
+            token.key.clone(),
+            Entry {
+                generation: token.generation,
+                transaction,
+            },
+        );
+        Ok(RoutedActions { token, actions })
+    }
+
     /// Registers a server transaction transactionally.
     ///
     /// # Errors
@@ -668,6 +698,35 @@ Content-Length: 0\r\n\r\n"
             routed.actions().first(),
             Some(ClientAction::SendAck(_))
         ));
+    }
+
+    #[test]
+    fn start_client_returns_fenced_initial_send_and_timers() {
+        let transaction = ClientTransaction::new(
+            request("INVITE", "z9hG4bK-one"),
+            false,
+            TimerConfig::default(),
+        )
+        .unwrap_or_else(|_| panic!("client transaction"));
+        let mut manager = TransactionManager::new(8).unwrap_or_else(|_| panic!("manager"));
+        let routed = manager
+            .start_client(transaction)
+            .unwrap_or_else(|_| panic!("start"));
+
+        assert_eq!(routed.token().role(), Role::Client);
+        assert!(matches!(
+            routed.actions().first(),
+            Some(ClientAction::Send(_))
+        ));
+        assert_eq!(
+            routed
+                .actions()
+                .iter()
+                .filter(|action| matches!(action, ClientAction::Schedule { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(manager.len(), 1);
     }
 
     #[test]

@@ -25,11 +25,13 @@
 
 use std::error::Error as StdError;
 use std::fmt;
+use std::io;
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
-use crate::rtp::session::RtpSession;
-use crate::rtp::transport::{Component, MediaPacketScratch, MediaSocketPair};
+use crate::rtp::security::PacketProtection;
+use crate::rtp::session::{RtcpIngressOutcome, RtpIngressOutcome, RtpSession};
+use crate::rtp::transport::{Component, MediaPacketScratch, MediaSocketPair, SocketError};
 use crate::runtime::admission::AdmissionLeaseGroup;
 use crate::runtime::deadline::{DeadlineError, DeadlineId, DeadlineOwner, DeadlineScheduler};
 use crate::runtime::media::MediaController;
@@ -39,10 +41,12 @@ use crate::sip::transaction::manager::{
     ManagerError as TransactionManagerError, TransactionManager,
 };
 use crate::sip::transport::failover::FailoverPlan;
+use crate::util::time::{advance_periodic, checked_deadline, minimum_deadline};
 
 use super::context::{CallContext, CallContextError};
 use super::events::{CallAction, CallCommand, CallEvent};
 use super::redirect::{RedirectError, RedirectHandler, RedirectPolicy};
+use super::signaling::{SignalingError, UdpSignaling};
 use super::state::{CallEndReason, CallState};
 use super::timers::CallTimer;
 use super::transfer::TransferTracker;
@@ -61,6 +65,10 @@ pub const MEDIA_TICK_INTERVAL: Duration = Duration::from_millis(10);
 pub const MAX_MEDIA_TICKS_PER_CYCLE: u64 = 8;
 /// Maximum due protocol deadlines consumed before returning to the mailbox.
 pub const MAX_DUE_DEADLINES_PER_CYCLE: usize = 64;
+/// Maximum media datagrams consumed for one readiness notification.
+pub const MAX_MEDIA_DATAGRAMS_PER_POLL: usize = 64;
+/// Maximum delay before the owner thread checks its nonblocking SIP socket.
+pub const SIGNALING_IO_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Immutable capacities and teardown policy for one call runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +144,8 @@ pub enum CallMessage {
     Event(CallEvent),
     /// RTP or RTCP socket readiness notification.
     NetworkReady(Component),
+    /// Call-owned SIP signaling socket is readable.
+    SignalingReady,
     /// Generation-fenced native audio queue notification.
     AudioReady {
         /// Media generation attached by the producer.
@@ -163,6 +173,16 @@ pub struct CallRuntimeDiagnostics {
     pub skipped_media_ticks: u64,
     /// Stale generation-fenced audio notifications rejected.
     pub stale_media_work: u64,
+    /// RTP and RTCP datagrams removed from call-owned sockets.
+    pub media_datagrams_received: u64,
+    /// Oversized, malformed, unauthenticated, or stream-invalid media datagrams.
+    pub media_datagrams_rejected: u64,
+    /// Audio RTP packets admitted to the bounded `NetEq` ingress queue.
+    pub rtp_audio_packets_queued: u64,
+    /// Negotiated RFC 4733 packets handled outside the audio decoder path.
+    pub dtmf_packets_received: u64,
+    /// Valid compound RTCP datagrams admitted to session state.
+    pub rtcp_packets_accepted: u64,
 }
 
 /// All mutable state associated with exactly one active call.
@@ -182,10 +202,12 @@ pub struct CallRuntime {
     media_sockets: Option<MediaSocketPair>,
     packet_scratch: Option<MediaPacketScratch>,
     rtp_session: Option<RtpSession>,
+    signaling: Option<UdpSignaling>,
     admission: AdmissionLeaseGroup,
     shutdown_grace: Duration,
     shutdown_deadline: Option<Duration>,
     next_media_deadline: Option<Duration>,
+    next_signaling_poll: Option<Duration>,
     shutting_down: bool,
     cleaned_up: bool,
     diagnostics: CallRuntimeDiagnostics,
@@ -228,10 +250,12 @@ impl CallRuntime {
             media_sockets: None,
             packet_scratch: None,
             rtp_session: None,
+            signaling: None,
             admission,
             shutdown_grace: config.shutdown_grace,
             shutdown_deadline: None,
             next_media_deadline: None,
+            next_signaling_poll: None,
             shutting_down: false,
             cleaned_up: false,
             diagnostics: CallRuntimeDiagnostics::default(),
@@ -296,6 +320,19 @@ impl CallRuntime {
         Ok(self)
     }
 
+    /// Installs one prebound call-owned UDP signaling driver before spawn.
+    ///
+    /// # Errors
+    ///
+    /// Rejects replacement or installation after ownership starts.
+    pub fn with_udp_signaling(mut self, signaling: UdpSignaling) -> Result<Self, CallRuntimeError> {
+        if self.owner.is_some() || self.signaling.is_some() {
+            return Err(CallRuntimeError::ResourcesAlreadyInstalled);
+        }
+        self.signaling = Some(signaling);
+        Ok(self)
+    }
+
     /// Claims this runtime for the current native thread exactly once.
     ///
     /// # Errors
@@ -330,11 +367,37 @@ impl CallRuntime {
         self.verify_owner()?;
         self.diagnostics.processed_messages = self.diagnostics.processed_messages.saturating_add(1);
         match message {
-            CallMessage::Event(event) => self
-                .context
-                .handle(event, now)
-                .map_err(CallRuntimeError::Context),
+            CallMessage::Event(event) => {
+                let actions = self
+                    .context
+                    .handle(event, now)
+                    .map_err(CallRuntimeError::Context)?;
+                if let Some(signaling) = self.signaling.as_mut() {
+                    if actions
+                        .iter()
+                        .any(|action| matches!(action, CallAction::SendInvite))
+                    {
+                        signaling
+                            .start(&mut self.transactions, &mut self.deadlines, now)
+                            .map_err(CallRuntimeError::Signaling)?;
+                        self.next_signaling_poll = Some(
+                            checked_deadline(now, SIGNALING_IO_POLL_INTERVAL)
+                                .map_err(|_| CallRuntimeError::TimeOverflow)?,
+                        );
+                    }
+                    signaling
+                        .execute_call_actions(
+                            &actions,
+                            &mut self.transactions,
+                            &mut self.deadlines,
+                            now,
+                        )
+                        .map_err(CallRuntimeError::Signaling)?;
+                }
+                Ok(actions)
+            }
             CallMessage::NetworkReady(component) => self.poll_network(component, now),
+            CallMessage::SignalingReady => self.poll_signaling(now),
             CallMessage::AudioReady {
                 generation,
                 direction: _,
@@ -355,22 +418,138 @@ impl CallRuntime {
         }
     }
 
-    /// Polls call-owned sockets after readiness was delivered to this owner.
+    /// Drains bounded work from one ready call-owned RTP or RTCP socket.
     ///
-    /// Socket parsing remains in RTP/SIP transport modules; this ownership
-    /// boundary intentionally performs no protocol mutation until those
-    /// drivers are installed into the runtime.
+    /// Each datagram is received into permanent call-local scratch storage and
+    /// immediately submitted to the call-owned [`RtpSession`]. Malformed,
+    /// unauthenticated, and otherwise stream-invalid packets are isolated to
+    /// the packet; fatal socket errors fail the call. Secure sessions never
+    /// reinterpret rejected clear packets as authenticated media.
     ///
     /// # Errors
     ///
     /// Rejects calls from any non-owner thread.
     pub fn poll_network(
         &mut self,
-        _component: Component,
-        _now: Duration,
+        component: Component,
+        now: Duration,
     ) -> Result<Vec<CallAction>, CallRuntimeError> {
         self.verify_owner()?;
+        let sockets = self
+            .media_sockets
+            .as_ref()
+            .ok_or(CallRuntimeError::MediaResourcesUnavailable)?;
+        let scratch = self
+            .packet_scratch
+            .as_mut()
+            .ok_or(CallRuntimeError::MediaResourcesUnavailable)?;
+        let session = self
+            .rtp_session
+            .as_mut()
+            .ok_or(CallRuntimeError::MediaResourcesUnavailable)?;
+
+        for _ in 0..MAX_MEDIA_DATAGRAMS_PER_POLL {
+            let datagram = match sockets.receive(component, scratch.receive()) {
+                Ok(datagram) => datagram,
+                Err(error) if error.io_kind() == Some(io::ErrorKind::WouldBlock) => break,
+                Err(SocketError::DatagramTooLarge { .. }) => {
+                    self.diagnostics.media_datagrams_received =
+                        self.diagnostics.media_datagrams_received.saturating_add(1);
+                    self.diagnostics.media_datagrams_rejected =
+                        self.diagnostics.media_datagrams_rejected.saturating_add(1);
+                    continue;
+                }
+                Err(error) => return Err(CallRuntimeError::MediaSocket(error)),
+            };
+            self.diagnostics.media_datagrams_received =
+                self.diagnostics.media_datagrams_received.saturating_add(1);
+            let accepted = match component {
+                Component::Rtp => match session.ingest_rtp(
+                    datagram.source(),
+                    datagram.payload(),
+                    now,
+                    PacketProtection::Plain,
+                ) {
+                    Ok(RtpIngressOutcome::Queued { .. }) => {
+                        self.diagnostics.rtp_audio_packets_queued =
+                            self.diagnostics.rtp_audio_packets_queued.saturating_add(1);
+                        true
+                    }
+                    Ok(RtpIngressOutcome::TelephoneEvent { .. }) => {
+                        self.diagnostics.dtmf_packets_received =
+                            self.diagnostics.dtmf_packets_received.saturating_add(1);
+                        true
+                    }
+                    Ok(RtpIngressOutcome::SourceProbation | RtpIngressOutcome::SourceSwitched) => {
+                        true
+                    }
+                    Ok(
+                        RtpIngressOutcome::ClassifiedOut(_)
+                        | RtpIngressOutcome::SourceRejected
+                        | RtpIngressOutcome::StreamRejected(_)
+                        | RtpIngressOutcome::AuxiliaryRejected(_)
+                        | RtpIngressOutcome::QueueDropped,
+                    )
+                    | Err(_) => false,
+                },
+                Component::Rtcp => match session.ingest_rtcp(
+                    datagram.source(),
+                    datagram.payload(),
+                    now,
+                    PacketProtection::Plain,
+                ) {
+                    Ok(RtcpIngressOutcome::Accepted { .. }) => {
+                        self.diagnostics.rtcp_packets_accepted =
+                            self.diagnostics.rtcp_packets_accepted.saturating_add(1);
+                        true
+                    }
+                    Ok(
+                        RtcpIngressOutcome::ClassifiedOut(_) | RtcpIngressOutcome::SourceRejected,
+                    )
+                    | Err(_) => false,
+                },
+            };
+            if !accepted {
+                self.diagnostics.media_datagrams_rejected =
+                    self.diagnostics.media_datagrams_rejected.saturating_add(1);
+            }
+        }
         Ok(Vec::new())
+    }
+
+    /// Drains bounded SIP UDP responses and applies their lifecycle events on
+    /// this same owner thread.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing signaling resources and preserves transport,
+    /// transaction, deadline, and lifecycle failures.
+    pub fn poll_signaling(&mut self, now: Duration) -> Result<Vec<CallAction>, CallRuntimeError> {
+        self.verify_owner()?;
+        let signaling = self
+            .signaling
+            .as_mut()
+            .ok_or(CallRuntimeError::SignalingUnavailable)?;
+        let events = signaling
+            .poll(
+                &mut self.transactions,
+                &mut self.deadlines,
+                &mut self.authentication,
+                now,
+            )
+            .map_err(CallRuntimeError::Signaling)?;
+        let mut actions = Vec::new();
+        for event in events {
+            let produced = self
+                .context
+                .handle(event, now)
+                .map_err(CallRuntimeError::Context)?;
+            signaling
+                .execute_call_actions(&produced, &mut self.transactions, &mut self.deadlines, now)
+                .map_err(CallRuntimeError::Signaling)?;
+            actions.extend(produced);
+        }
+        Ok(actions)
     }
 
     /// Schedules one generation-fenced call-local deadline.
@@ -408,8 +587,8 @@ impl CallRuntime {
     pub fn start_media_clock(&mut self, now: Duration) -> Result<(), CallRuntimeError> {
         self.verify_owner()?;
         self.next_media_deadline = Some(
-            now.checked_add(MEDIA_TICK_INTERVAL)
-                .ok_or(CallRuntimeError::TimeOverflow)?,
+            checked_deadline(now, MEDIA_TICK_INTERVAL)
+                .map_err(|_| CallRuntimeError::TimeOverflow)?,
         );
         Ok(())
     }
@@ -428,12 +607,45 @@ impl CallRuntime {
     ) -> Result<Vec<CallAction>, CallRuntimeError> {
         self.verify_owner()?;
         let mut actions = Vec::new();
+        if self
+            .next_signaling_poll
+            .is_some_and(|deadline| now >= deadline)
+        {
+            actions.extend(self.poll_signaling(now)?);
+            let current = self
+                .next_signaling_poll
+                .ok_or(CallRuntimeError::TimeOverflow)?;
+            let advance = advance_periodic(current, now, SIGNALING_IO_POLL_INTERVAL, 1)
+                .map_err(|_| CallRuntimeError::TimeOverflow)?
+                .ok_or(CallRuntimeError::TimeOverflow)?;
+            self.next_signaling_poll = Some(advance.next_deadline());
+        }
         for _ in 0..MAX_DUE_DEADLINES_PER_CYCLE {
             let Some(due) = self.deadlines.poll(now) else {
                 break;
             };
             self.diagnostics.processed_deadlines =
                 self.diagnostics.processed_deadlines.saturating_add(1);
+            if due.owner() == DeadlineOwner::Transaction {
+                let signaling = self
+                    .signaling
+                    .as_mut()
+                    .ok_or(CallRuntimeError::SignalingUnavailable)?;
+                if let Some(event) = signaling
+                    .on_deadline(due.id(), &mut self.transactions, &mut self.deadlines, now)
+                    .map_err(CallRuntimeError::Signaling)?
+                {
+                    actions.extend(
+                        self.context
+                            .handle(event, now)
+                            .map_err(CallRuntimeError::Context)?,
+                    );
+                }
+                continue;
+            }
+            if due.owner() != DeadlineOwner::Call {
+                continue;
+            }
             let Some(timer) = CallTimer::from_kind(due.kind()) else {
                 continue;
             };
@@ -475,6 +687,7 @@ impl CallRuntime {
             self.deadlines.next_deadline(),
             self.shutdown_deadline,
             self.next_media_deadline,
+            self.next_signaling_poll,
         ]))
     }
 
@@ -493,9 +706,10 @@ impl CallRuntime {
         self.dialogs.begin_shutdown();
         self.media.begin_draining();
         self.next_media_deadline = None;
+        self.next_signaling_poll = None;
         self.shutdown_deadline = Some(
-            now.checked_add(self.shutdown_grace)
-                .ok_or(CallRuntimeError::TimeOverflow)?,
+            checked_deadline(now, self.shutdown_grace)
+                .map_err(|_| CallRuntimeError::TimeOverflow)?,
         );
         match self.context.lifecycle().state() {
             CallState::Idle => Ok(self.context.force_end(CallEndReason::LocalHangup)),
@@ -527,8 +741,10 @@ impl CallRuntime {
         self.transactions.begin_shutdown();
         self.dialogs.begin_shutdown();
         self.next_media_deadline = None;
+        self.next_signaling_poll = None;
         self.media.begin_draining();
         self.media.close();
+        self.signaling = None;
         self.rtp_session = None;
         self.media_sockets = None;
         self.packet_scratch = None;
@@ -675,25 +891,21 @@ impl CallRuntime {
         let Some(next) = self.next_media_deadline else {
             return Ok(());
         };
-        if now < next {
+        let Some(advance) =
+            advance_periodic(next, now, MEDIA_TICK_INTERVAL, MAX_MEDIA_TICKS_PER_CYCLE)
+                .map_err(|_| CallRuntimeError::TimeOverflow)?
+        else {
             return Ok(());
-        }
-        let interval_nanos = MEDIA_TICK_INTERVAL.as_nanos();
-        let late_nanos = now.saturating_sub(next).as_nanos();
-        let due = u64::try_from(late_nanos / interval_nanos)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
-        let executed = due.min(MAX_MEDIA_TICKS_PER_CYCLE);
-        self.diagnostics.media_ticks = self.diagnostics.media_ticks.saturating_add(executed);
+        };
+        self.diagnostics.media_ticks = self
+            .diagnostics
+            .media_ticks
+            .saturating_add(advance.executed());
         self.diagnostics.skipped_media_ticks = self
             .diagnostics
             .skipped_media_ticks
-            .saturating_add(due.saturating_sub(executed));
-        let advance = duration_mul(MEDIA_TICK_INTERVAL, due)?;
-        self.next_media_deadline = Some(
-            next.checked_add(advance)
-                .ok_or(CallRuntimeError::TimeOverflow)?,
-        );
+            .saturating_add(advance.skipped());
+        self.next_media_deadline = Some(advance.next_deadline());
         Ok(())
     }
 }
@@ -713,29 +925,13 @@ impl fmt::Debug for CallRuntime {
             .field("media_sockets", &self.media_sockets.is_some())
             .field("packet_scratch", &self.packet_scratch.is_some())
             .field("rtp_session", &self.rtp_session.is_some())
+            .field("signaling", &self.signaling.is_some())
+            .field("signaling_poll_active", &self.next_signaling_poll.is_some())
             .field("shutting_down", &self.shutting_down)
             .field("cleaned_up", &self.cleaned_up)
             .field("diagnostics", &self.diagnostics)
             .finish_non_exhaustive()
     }
-}
-
-fn minimum_deadline<const N: usize>(deadlines: [Option<Duration>; N]) -> Option<Duration> {
-    deadlines.into_iter().flatten().min()
-}
-
-fn duration_mul(value: Duration, multiplier: u64) -> Result<Duration, CallRuntimeError> {
-    let nanos = value
-        .as_nanos()
-        .checked_mul(u128::from(multiplier))
-        .ok_or(CallRuntimeError::TimeOverflow)?;
-    let seconds = nanos / 1_000_000_000;
-    let subsecond =
-        u32::try_from(nanos % 1_000_000_000).map_err(|_| CallRuntimeError::TimeOverflow)?;
-    Ok(Duration::new(
-        u64::try_from(seconds).map_err(|_| CallRuntimeError::TimeOverflow)?,
-        subsecond,
-    ))
 }
 
 /// Call runtime construction, ownership, or processing failure.
@@ -759,6 +955,14 @@ pub enum CallRuntimeError {
     Deadlines(DeadlineError),
     /// Deterministic call context rejected an event.
     Context(CallContextError),
+    /// RTP readiness arrived before its complete call-owned resource set.
+    MediaResourcesUnavailable,
+    /// Fatal call-owned RTP or RTCP socket operation failed.
+    MediaSocket(SocketError),
+    /// SIP action required a call-owned signaling driver that was not installed.
+    SignalingUnavailable,
+    /// Call-owned SIP transport, transaction, or timer execution failed.
+    Signaling(SignalingError),
 }
 
 impl fmt::Display for CallRuntimeError {
@@ -775,24 +979,41 @@ impl StdError for CallRuntimeError {
             Self::Redirect(source) => Some(source),
             Self::Deadlines(source) => Some(source),
             Self::Context(source) => Some(source),
+            Self::MediaSocket(source) => Some(source),
+            Self::Signaling(source) => Some(source),
             Self::WrongOwnerThread
             | Self::ZeroShutdownGrace
             | Self::ResourcesAlreadyInstalled
-            | Self::TimeOverflow => None,
+            | Self::TimeOverflow
+            | Self::MediaResourcesUnavailable
+            | Self::SignalingUnavailable => None,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
     use std::thread;
     use std::time::Duration;
 
     use super::{
-        CallMessage, CallRuntime, CallRuntimeConfig, MAX_MEDIA_TICKS_PER_CYCLE, MEDIA_TICK_INTERVAL,
+        CallMessage, CallRuntime, CallRuntimeConfig, CallRuntimeError, MAX_MEDIA_TICKS_PER_CYCLE,
+        MEDIA_TICK_INTERVAL,
     };
     use crate::call::context::CallContext;
     use crate::call::events::{CallAction, CallCommand, CallEvent};
+    use crate::rtp::clock::RtpClockRate;
+    use crate::rtp::liveness::MediaLiveness;
+    use crate::rtp::security::MediaSecurityPolicy;
+    use crate::rtp::session::RtpSession;
+    use crate::rtp::source::SourcePolicy;
+    use crate::rtp::state::RtpReceiveConfig;
+    use crate::rtp::transport::symmetric::{SymmetricConfig, SymmetricEndpoints};
+    use crate::rtp::transport::{
+        Component, DEFAULT_MAX_MEDIA_DATAGRAM_BYTES, MediaPacketScratch, MediaSocketPair, PortPool,
+        SocketConfig,
+    };
     use crate::runtime::admission::AdmissionLeaseGroup;
 
     fn runtime() -> CallRuntime {
@@ -803,6 +1024,67 @@ mod tests {
             CallRuntimeConfig::default(),
         )
         .unwrap_or_else(|_| panic!("runtime"))
+    }
+
+    fn address(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    fn media_session(remote_rtp: SocketAddr) -> RtpSession {
+        let clock = RtpClockRate::new(8_000).unwrap_or_else(|_| panic!("clock"));
+        let receive =
+            RtpReceiveConfig::new(0, clock, Some(7)).unwrap_or_else(|_| panic!("receive config"));
+        let control_endpoint = SocketAddr::new(
+            remote_rtp.ip(),
+            remote_rtp
+                .port()
+                .checked_add(1)
+                .unwrap_or(remote_rtp.port()),
+        );
+        let endpoints =
+            SymmetricEndpoints::new(remote_rtp, control_endpoint, SymmetricConfig::default())
+                .unwrap_or_else(|_| panic!("endpoints"));
+        let liveness = MediaLiveness::new(
+            Duration::ZERO,
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        )
+        .unwrap_or_else(|_| panic!("liveness"));
+        RtpSession::new(
+            receive,
+            SourcePolicy::default(),
+            endpoints,
+            MediaSecurityPolicy::PlainAllowed,
+            liveness,
+            8,
+        )
+        .unwrap_or_else(|_| panic!("session"))
+    }
+
+    fn media_sockets() -> (PortPool, MediaSocketPair) {
+        for port in (42_000_u16..60_000).step_by(2) {
+            let pool = PortPool::new(port, port).unwrap_or_else(|_| panic!("pool"));
+            let lease = pool.allocate().unwrap_or_else(|| panic!("lease"));
+            if let Ok(sockets) = MediaSocketPair::bind(
+                lease,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                SocketConfig::default(),
+            ) {
+                return (pool, sockets);
+            }
+        }
+        panic!("free RTP pair")
+    }
+
+    fn rtp_packet(sequence: u16) -> [u8; 13] {
+        let mut packet = [0_u8; 13];
+        packet[0] = 0x80;
+        packet[1] = 0;
+        packet[2..4].copy_from_slice(&sequence.to_be_bytes());
+        packet[4..8].copy_from_slice(&(u32::from(sequence) * 80).to_be_bytes());
+        packet[8..12].copy_from_slice(&7_u32.to_be_bytes());
+        packet[12] = 0x55;
+        packet
     }
 
     #[test]
@@ -890,5 +1172,64 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(runtime.diagnostics().stale_media_work, 1);
+    }
+
+    #[test]
+    fn network_readiness_requires_complete_call_owned_media_resources() {
+        let mut runtime = runtime();
+        runtime
+            .claim_current_thread()
+            .unwrap_or_else(|_| panic!("claim"));
+        assert!(matches!(
+            runtime.poll_network(Component::Rtp, Duration::ZERO),
+            Err(CallRuntimeError::MediaResourcesUnavailable)
+        ));
+    }
+
+    #[test]
+    fn owner_thread_drains_real_rtp_socket_into_session_without_packet_allocation() {
+        let (_pool, sockets) = media_sockets();
+        let destination = sockets
+            .local_addr(Component::Rtp)
+            .unwrap_or_else(|_| panic!("local RTP"));
+        let sender = UdpSocket::bind(address(0)).unwrap_or_else(|_| panic!("sender"));
+        let remote = sender
+            .local_addr()
+            .unwrap_or_else(|_| panic!("sender address"));
+        let scratch = MediaPacketScratch::new(DEFAULT_MAX_MEDIA_DATAGRAM_BYTES)
+            .unwrap_or_else(|_| panic!("scratch"));
+        let mut runtime = runtime()
+            .with_media_sockets(sockets)
+            .and_then(|runtime| runtime.with_packet_scratch(scratch))
+            .and_then(|runtime| runtime.with_rtp_session(media_session(remote)))
+            .unwrap_or_else(|_| panic!("media runtime"));
+        runtime
+            .claim_current_thread()
+            .unwrap_or_else(|_| panic!("claim"));
+
+        for sequence in 1..=3 {
+            let packet = rtp_packet(sequence);
+            assert_eq!(
+                sender
+                    .send_to(&packet, destination)
+                    .unwrap_or_else(|_| panic!("send RTP")),
+                packet.len()
+            );
+        }
+        assert!(
+            sender
+                .send_to(&[0, 1], destination)
+                .is_ok_and(|written| written == 2)
+        );
+
+        assert!(
+            runtime
+                .poll_network(Component::Rtp, Duration::from_millis(30))
+                .is_ok()
+        );
+        let diagnostics = runtime.diagnostics();
+        assert_eq!(diagnostics.media_datagrams_received, 4);
+        assert!(diagnostics.rtp_audio_packets_queued >= 1);
+        assert!(diagnostics.media_datagrams_rejected >= 1);
     }
 }

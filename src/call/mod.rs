@@ -27,6 +27,8 @@ pub mod manager;
 pub mod redirect;
 /// Exclusive mutable state owner for one active call.
 pub mod runtime;
+/// Call-owned executable SIP signaling transport.
+pub mod signaling;
 pub mod state;
 /// Dedicated native OS-thread execution wrapper.
 pub mod thread;
@@ -49,6 +51,7 @@ pub use runtime::{
     AudioDirection, CallMessage, CallRuntime, CallRuntimeConfig, CallRuntimeDiagnostics,
     CallRuntimeError,
 };
+pub use signaling::{SignalingError, UdpSignaling};
 pub use state::{CallEndReason, CallState};
 pub use thread::{CallExit, CallExitKind, CallThread, CallThreadConfig, CallThreadError};
 pub use transfer::{

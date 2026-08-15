@@ -27,6 +27,7 @@ use super::events::{CallAction, CallEvent};
 use super::handle::{CallActionReceiveError, CallHandle, CallSubmitErrorKind, CallToken};
 use super::runtime::{CallMessage, CallRuntime};
 use super::thread::{CallExit, CallThread, CallThreadConfig, CallThreadError};
+use crate::util::id::IdGenerator;
 
 /// Maximum calls configurable in one registry.
 pub const MAX_CALL_MANAGER_CAPACITY: usize = 1_000_000;
@@ -35,7 +36,7 @@ pub const MAX_CALL_MANAGER_CAPACITY: usize = 1_000_000;
 pub struct CallManager {
     calls: HashMap<u64, CallHandle>,
     capacity: usize,
-    next_generation: u64,
+    generations: IdGenerator,
     accepting: bool,
     thread_config: CallThreadConfig,
 }
@@ -69,7 +70,7 @@ impl CallManager {
         Ok(Self {
             calls,
             capacity,
-            next_generation: 1,
+            generations: IdGenerator::new(),
             accepting: true,
             thread_config,
         })
@@ -100,19 +101,19 @@ impl CallManager {
         if self.calls.len() >= self.capacity {
             return Err(CallManagerError::AtCapacity);
         }
-        let generation = self.next_generation;
-        let next_generation = generation
-            .checked_add(1)
-            .ok_or(CallManagerError::GenerationExhausted)?;
         self.calls
             .try_reserve(1)
             .map_err(|_| CallManagerError::AllocationFailed)?;
+        let generation = self
+            .generations
+            .allocate()
+            .map_err(|_| CallManagerError::GenerationExhausted)?
+            .get();
         let token = CallToken::new(call_id, generation);
         let spawned = CallThread::spawn(token, runtime, self.thread_config)
             .map_err(CallManagerError::Thread)?;
         let handle = CallHandle::from_spawned(token, spawned);
         self.calls.insert(call_id, handle);
-        self.next_generation = next_generation;
         Ok(token)
     }
 

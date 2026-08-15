@@ -21,7 +21,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+
+use crate::util::time::MonotonicClock;
 
 use super::handle::{
     ActionReceiver, ActionSender, CallQueueSnapshot, CallToken, CommandReceiver, CommandSender,
@@ -264,10 +265,10 @@ fn call_thread_entry(
 ) -> CallExit {
     let owner = thread::current().id();
     status.mark_running(owner);
-    let started = Instant::now();
+    let clock = MonotonicClock::start();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         runtime.claim_current_thread().map_err(|_| ())?;
-        run_call(&mut runtime, &commands, &actions, started)
+        run_call(&mut runtime, &commands, &actions, &clock)
     }));
     let mut kind = match outcome {
         Ok(Ok(())) => CallExitKind::Completed,
@@ -302,18 +303,20 @@ fn run_call(
     runtime: &mut CallRuntime,
     commands: &CommandReceiver,
     actions: &ActionSender,
-    started: Instant,
+    clock: &MonotonicClock,
 ) -> Result<(), ()> {
     let mut mailbox_open = true;
     loop {
-        let now = started.elapsed();
+        let now = clock.now();
         let due = runtime.process_due_deadlines(now).map_err(|_| ())?;
-        actions.try_send(due).map_err(|_| ())?;
+        if !due.is_empty() {
+            actions.try_send(due).map_err(|_| ())?;
+        }
         if runtime.is_finished() {
             return Ok(());
         }
         let deadline = runtime.next_deadline().map_err(|_| ())?;
-        let wait = deadline.map(|at| at.saturating_sub(started.elapsed()));
+        let wait = deadline.map(|at| clock.remaining_until(at));
         let message = if mailbox_open {
             match wait {
                 Some(timeout) => match commands.recv_timeout(timeout) {
@@ -342,11 +345,15 @@ fn run_call(
             None
         };
         if let Some(message) = message {
-            let produced = runtime.handle(message, started.elapsed()).map_err(|_| ())?;
-            actions.try_send(produced).map_err(|_| ())?;
+            let produced = runtime.handle(message, clock.now()).map_err(|_| ())?;
+            if !produced.is_empty() {
+                actions.try_send(produced).map_err(|_| ())?;
+            }
         } else if !mailbox_open {
-            let produced = runtime.begin_shutdown(started.elapsed()).map_err(|_| ())?;
-            actions.try_send(produced).map_err(|_| ())?;
+            let produced = runtime.begin_shutdown(clock.now()).map_err(|_| ())?;
+            if !produced.is_empty() {
+                actions.try_send(produced).map_err(|_| ())?;
+            }
         }
     }
 }
