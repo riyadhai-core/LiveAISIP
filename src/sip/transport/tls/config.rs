@@ -23,7 +23,7 @@
 //! cannot be disabled through this API. Only TLS 1.2 and TLS 1.3 are modeled.
 //! Handshake time, certificate-chain bytes, and certificate count are bounded
 //! before the cryptographic backend exposes an established flow. The concrete
-//! verified Rustls integration lives in [`super::tls_driver`].
+//! verified Rustls integration lives in [`crate::sip::transport::tls_driver`].
 
 use std::error::Error as StdError;
 use std::fmt;

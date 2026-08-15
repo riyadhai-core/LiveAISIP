@@ -19,24 +19,27 @@
 
 //! Owned inbound RTP session boundary before `NetEq`.
 
+/// RTP receive-state validation and sequence tracking.
+pub mod receive;
+/// Call-owned RTCP scheduling and report construction.
+pub mod rtcp;
+
 use std::error::Error as StdError;
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use self::receive::{
+    AuxiliaryPacketOutcome, ReceivePacketOutcome, RtpReceiveConfig, RtpReceiveState, RtpStateError,
+};
+use self::rtcp::{RtcpScheduleConfig, RtcpScheduler, RtcpSchedulerError, ScheduledReport};
 use super::dtmf::{TelephoneEvent, TelephoneEventError};
 use super::liveness::{MediaLiveness, MediaLivenessError};
 use super::packet::rtcp::{CompoundPolicy, CompoundRtcp, CompoundRtcpError, Goodbye, RtcpPacket};
 use super::packet::rtp::{MAX_RTP_PACKET_BYTES, RtpPacket, RtpPacketError};
 use super::queue::{BoundedQueue, OverflowPolicy, PushOutcome, QueueDiagnostics, QueueError};
-use super::rtcp_scheduler::{
-    RtcpScheduleConfig, RtcpScheduler, RtcpSchedulerError, ScheduledReport,
-};
 use super::security::{MediaSecurityError, MediaSecurityPolicy, PacketProtection};
 use super::source::{RemoteSourceTracker, SourceObservation, SourcePolicy};
-use super::state::{
-    AuxiliaryPacketOutcome, ReceivePacketOutcome, RtpReceiveConfig, RtpReceiveState, RtpStateError,
-};
 use super::stats::reorder::{DelayedLossSnapshot, DelayedLossTracker};
 use super::transport::socket::Component;
 use super::transport::symmetric::{SymmetricEndpoints, SymmetricError, SymmetricObservation};

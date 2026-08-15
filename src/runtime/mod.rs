@@ -17,15 +17,24 @@
 //! A high-performance SIP server developed by `RiyadhAI LLC` for large-scale
 //! realtime AI telephony workloads.
 
-//! LiveAISIP Runtime orchestration boundaries.
+//! Process-wide LiveAISIP runtime services.
 
 /// Bounded call/media admission and retry suppression.
 pub mod admission;
-/// Shared generation-fenced monotonic deadlines.
-pub mod deadline;
-/// Runtime media ownership and reconfiguration.
-pub mod media;
 /// Coordinated graceful shutdown.
 pub mod shutdown;
-/// Router control and SIP signaling ownership.
-pub mod signaling;
+
+/// Temporary compatibility path for call-owned deadline scheduling.
+pub mod deadline {
+    pub use crate::call::execution::deadline::*;
+}
+
+/// Temporary compatibility path for call-owned media generation control.
+pub mod media {
+    pub use crate::call::media::controller::*;
+}
+
+/// Temporary compatibility path for call health evaluation.
+pub mod signaling {
+    pub use crate::call::model::health::*;
+}

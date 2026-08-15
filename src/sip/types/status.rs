@@ -24,7 +24,7 @@
 //! requiring every code to be known in advance.
 //!
 //! The standard response classes are represented separately by
-//! [`ResponseClass`].
+//! [`ResponseClass`](crate::sip::types::status::ResponseClass).
 
 use std::error::Error as StdError;
 use std::fmt;

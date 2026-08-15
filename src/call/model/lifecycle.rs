@@ -15,8 +15,8 @@
 use std::error::Error as StdError;
 use std::fmt;
 
+use super::branch::{DialogBranchId, ForkError, ForkSet};
 use super::events::{CallAction, CallCommand, CallEvent};
-use super::leg::{DialogBranchId, ForkError, ForkSet};
 use super::state::{CallEndReason, CallState, reason_from_status};
 
 /// Single-authority call lifecycle.

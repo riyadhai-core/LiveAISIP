@@ -25,7 +25,8 @@
 //! An Allow value is an ordered comma-separated list of SIP methods. An empty
 //! field value is valid and represents support for no methods.
 //!
-//! Core SIP methods use the shared allocation-free [`Method`] representation.
+//! Core SIP methods use the shared allocation-free
+//! [`Method`](crate::sip::types::method::Method) representation.
 //! Valid extension methods remain supported and preserve their exact spelling.
 //!
 //! SIP method names are case-sensitive. This module therefore does not

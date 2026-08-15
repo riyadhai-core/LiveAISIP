@@ -5,7 +5,7 @@
 //!
 //! This module binds the deterministic client transaction engine to a real
 //! [`UdpDriver`]. It remains owned and invoked exclusively by one
-//! [`CallRuntime`](super::runtime::CallRuntime); socket I/O never mutates call
+//! [`CallRuntime`](crate::call::execution::runtime::CallRuntime); socket I/O never mutates call
 //! state from another thread.
 
 use std::error::Error as StdError;
@@ -15,8 +15,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::call::execution::deadline::{
+    DeadlineError, DeadlineId, DeadlineOwner, DeadlineScheduler,
+};
+use crate::call::model::branch::DialogBranchId;
+use crate::call::model::events::{CallAction, CallEvent};
 use crate::net::address::{OutboundBindError, resolve_outbound_udp_bind};
-use crate::runtime::deadline::{DeadlineError, DeadlineId, DeadlineOwner, DeadlineScheduler};
 use crate::sip::auth::{
     AuthChallenge, AuthContext, AuthContextError, AuthScope, ChallengeParseError, DigestCredentials,
 };
@@ -68,9 +72,6 @@ use crate::sip::validation::headers::{
 use crate::sip::validation::request::ValidatedRequest;
 use crate::sip::validation::response::ValidatedResponse;
 use crate::util::time::checked_deadline;
-
-use super::events::{CallAction, CallEvent};
-use super::leg::DialogBranchId;
 
 /// Maximum SIP datagrams drained for one call-thread readiness turn.
 pub const MAX_SIGNALING_DATAGRAMS_PER_POLL: usize = 64;
@@ -1266,7 +1267,7 @@ pub enum SignalingError {
     /// Monotonic deadline overflowed.
     TimeOverflow,
     /// Response dialog branch was invalid.
-    Branch(super::leg::ForkError),
+    Branch(crate::call::model::branch::ForkError),
     /// A generated Via value was invalid.
     Via(crate::sip::headers::via::ParseError),
     /// A generated `CSeq` value was invalid.

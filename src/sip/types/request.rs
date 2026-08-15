@@ -19,7 +19,8 @@
 
 //! Immutable canonical outbound SIP request.
 //!
-//! [`Request`] is the finished value produced by the bounded request builder.
+//! [`Request`](crate::sip::types::request::Request) is the finished value produced
+//! by the bounded request builder.
 //! It is deliberately distinct from
 //! [`RawMessage`](crate::sip::types::message::RawMessage), which losslessly
 //! represents untrusted received wire bytes, and from

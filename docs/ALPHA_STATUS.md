@@ -2,9 +2,9 @@
 
 This repository is the outbound-primary LiveAISIP Runtime SIP/RTP core. It is
 still alpha software: the deterministic protocol and resource-policy layers
-below are implemented, while native libwebrtc, SRTP cryptography, socket-loop
-integration, Router control transport, and Python bindings remain separate
-integration stages.
+below are implemented, while the Rust playout engine, Sonora processing, SRTP
+cryptography, event-driven call reactor, Router control transport, and Python
+bindings remain separate integration stages.
 
 ## Architecture invariant
 
@@ -33,7 +33,7 @@ described as production-ready elsewhere.
 | 401/407 Digest retry | yes | yes | yes | yes | no | no |
 | CANCEL and final-response races | yes | yes | yes | partial | no | no |
 | Dialog Contact/Record-Route routing | yes | yes | yes | yes | no | no |
-| In-dialog inbound requests | yes | partial | no | partial | no | no |
+| In-dialog inbound requests | yes | partial | partial | partial | no | no |
 | PRACK/100rel | yes | yes | no | simulated | no | no |
 | Session timers | yes | yes | no | simulated | no | no |
 | REFER/NOTIFY transfer | yes | yes | no | simulated | no | no |
@@ -85,8 +85,8 @@ classification, and media security.
   policy.
 - Reliable TCP/TLS socket workers and media SRTP/SRTCP integration. The SIP
   UDP socket boundary is implemented.
-- Native libwebrtc NetEq, resampler, and APM implementation behind the reserved
-  media boundaries.
+- Rust playout behavior validated against the local WebRTC NetEq reference and
+  pinned Sonora resampling/APM integration.
 - The exact 24 kHz mono PCM pointer/handle bridge and Protobuf control bridge.
 - OpenAI Realtime and the LiveKit-style Python SDK surface.
 - Carrier and FreeSWITCH interoperability, impairment, soak, fuzz, and load

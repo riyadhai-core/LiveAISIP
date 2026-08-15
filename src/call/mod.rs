@@ -12,48 +12,83 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Actor-owned outbound call orchestration.
+//! Call-owned model, execution, signaling, and media coordination.
 
-/// Single-owner call actor context.
-pub mod context;
-pub mod events;
-/// External bounded capability for one native call owner.
-pub mod handle;
-pub mod leg;
-pub mod lifecycle;
-/// Bounded generation-fenced call registry.
-pub mod manager;
-/// Explicit 3xx redirect handling policy.
-pub mod redirect;
-/// Exclusive mutable state owner for one active call.
-pub mod runtime;
-/// Call-owned executable SIP signaling transport.
+pub mod execution;
+pub mod media;
+pub mod model;
 pub mod signaling;
-pub mod state;
-/// Dedicated native OS-thread execution wrapper.
-pub mod thread;
-/// Call-level deadline identities.
-pub mod timers;
-/// Blind and attended transfer request/state machinery.
-pub mod transfer;
 
-pub use events::{
-    CallAction, CallCommand, CallEvent, CallReference, TransferTarget, TransferTargetError,
-};
-pub use handle::{
+pub use execution::handle::{
     CallActionReceiveError, CallHandle, CallQueueSnapshot, CallStatusSnapshot, CallSubmitError,
     CallSubmitErrorKind, CallThreadPhase, CallToken,
 };
-pub use leg::{DialogBranchId, ForkSet};
-pub use lifecycle::{CallLifecycle, LifecycleError};
-pub use redirect::{RedirectDecision, RedirectError, RedirectHandler, RedirectPolicy};
-pub use runtime::{
+pub use execution::runtime::{
     AudioDirection, CallMessage, CallRuntime, CallRuntimeConfig, CallRuntimeDiagnostics,
     CallRuntimeError,
 };
-pub use signaling::{SignalingError, UdpSignaling};
-pub use state::{CallEndReason, CallState};
-pub use thread::{CallExit, CallExitKind, CallThread, CallThreadConfig, CallThreadError};
-pub use transfer::{
+pub use execution::thread::{
+    CallExit, CallExitKind, CallThread, CallThreadConfig, CallThreadError,
+};
+pub use model::branch::{DialogBranchId, ForkSet};
+pub use model::events::{
+    CallAction, CallCommand, CallEvent, CallReference, TransferTarget, TransferTargetError,
+};
+pub use model::lifecycle::{CallLifecycle, LifecycleError};
+pub use model::redirect::{RedirectDecision, RedirectError, RedirectHandler, RedirectPolicy};
+pub use model::state::{CallEndReason, CallState};
+pub use model::transfer::{
     TransferError, TransferNotification, TransferRequestHeaders, TransferState, TransferTracker,
 };
+pub use signaling::{SignalingError, UdpSignaling};
+
+// Temporary source-compatibility paths while downstream users migrate to the
+// ownership-oriented module tree.
+/// Compatibility re-export of [`model::context`].
+pub mod context {
+    pub use super::model::context::*;
+}
+/// Compatibility re-export of [`model::events`].
+pub mod events {
+    pub use super::model::events::*;
+}
+/// Compatibility re-export of [`execution::handle`].
+pub mod handle {
+    pub use super::execution::handle::*;
+}
+/// Compatibility re-export of [`model::branch`].
+pub mod leg {
+    pub use super::model::branch::*;
+}
+/// Compatibility re-export of [`model::lifecycle`].
+pub mod lifecycle {
+    pub use super::model::lifecycle::*;
+}
+/// Compatibility re-export of [`execution::manager`].
+pub mod manager {
+    pub use super::execution::manager::*;
+}
+/// Compatibility re-export of [`model::redirect`].
+pub mod redirect {
+    pub use super::model::redirect::*;
+}
+/// Compatibility re-export of [`execution::runtime`].
+pub mod runtime {
+    pub use super::execution::runtime::*;
+}
+/// Compatibility re-export of [`model::state`].
+pub mod state {
+    pub use super::model::state::*;
+}
+/// Compatibility re-export of [`execution::thread`].
+pub mod thread {
+    pub use super::execution::thread::*;
+}
+/// Compatibility re-export of [`execution::timer`].
+pub mod timers {
+    pub use super::execution::timer::*;
+}
+/// Compatibility re-export of [`model::transfer`].
+pub mod transfer {
+    pub use super::model::transfer::*;
+}

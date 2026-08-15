@@ -355,7 +355,7 @@ fn run_call(
 fn publish_actions(
     runtime: &CallRuntime,
     actions: &ActionSender,
-    produced: Vec<super::events::CallAction>,
+    produced: Vec<crate::call::model::events::CallAction>,
 ) -> Result<(), ()> {
     if produced.is_empty() {
         return Ok(());

@@ -20,7 +20,8 @@
 //! Bounded RFC 3263 destination planning.
 //!
 //! DNS I/O deliberately remains outside this module. A runtime resolver feeds
-//! validated, TTL-cached answers into [`ResolverRecords`], while this policy
+//! validated, TTL-cached answers into
+//! [`ResolverRecords`](crate::sip::transport::resolver::ResolverRecords), while this policy
 //! core applies URI transport constraints, SRV ordering, secure-transport
 //! rules, address expansion, deduplication, and bounded failover.
 

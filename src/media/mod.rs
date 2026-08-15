@@ -17,13 +17,18 @@
 //! A high-performance SIP server developed by `RiyadhAI LLC` for large-scale
 //! realtime AI telephony workloads.
 
-//! Native media contracts above RTP and below Python AI.
+//! Native media contracts above RTP and below the external SDK boundary.
 
-/// WebRTC audio processing integration.
-pub mod apm;
-/// Fixed AI PCM frame and network packetization types.
-pub mod audio;
-/// Native FFI boundary.
-pub mod ffi;
-/// WebRTC `NetEq` integration.
-pub mod neteq;
+/// Validated audio formats and packetization.
+pub mod format;
+/// Fixed-size PCM frame contracts.
+pub mod frame;
+
+/// Temporary compatibility path for the former combined audio module.
+pub mod audio {
+    pub use super::format::{AudioError, NetworkPacketization};
+    pub use super::frame::{
+        AI_BYTES_PER_FRAME, AI_FRAME_DURATION_MS, AI_SAMPLE_RATE_HZ, AI_SAMPLES_PER_FRAME,
+        AiAudioFrame,
+    };
+}

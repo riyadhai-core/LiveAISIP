@@ -22,9 +22,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::ThreadId;
 use std::time::Duration;
 
-use super::events::{CallAction, CallEvent, CallReference};
 use super::runtime::CallMessage;
 use super::thread::{CallExit, CallThread, CallThreadError, SpawnedCall};
+use crate::call::model::events::{CallAction, CallEvent, CallReference};
 
 /// Generation-fenced identity for one native call runtime.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

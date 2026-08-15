@@ -19,7 +19,7 @@
 
 //! Immutable canonical outbound SIP response.
 //!
-//! [`Response`] is the finished value produced by the bounded response
+//! [`Response`](crate::sip::types::response::Response) is the finished value produced by the bounded response
 //! builder. It is distinct from the lossless untrusted wire representation and
 //! from the validated inbound response envelope. Private fields and a single
 //! builder-owned construction path preserve required header, singleton,

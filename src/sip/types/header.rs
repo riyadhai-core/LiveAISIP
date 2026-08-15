@@ -26,7 +26,8 @@
 //! header names retain their original spelling while comparing
 //! case-insensitively as required by SIP.
 //!
-//! [`HeaderKind`] owns the authoritative allocation-free registry for
+//! [`HeaderKind`](crate::sip::types::header::HeaderKind) owns the authoritative
+//! allocation-free registry for
 //! recognized long and compact SIP header names. Structural parsers use that
 //! registry directly so header classification cannot diverge between parsing
 //! layers.

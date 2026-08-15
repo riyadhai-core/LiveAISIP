@@ -29,12 +29,14 @@ use std::io;
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
+use crate::call::execution::deadline::{
+    DeadlineError, DeadlineId, DeadlineOwner, DeadlineScheduler,
+};
+use crate::call::media::controller::MediaController;
 use crate::rtp::security::PacketProtection;
 use crate::rtp::session::{RtcpIngressOutcome, RtpIngressOutcome, RtpSession};
 use crate::rtp::transport::{Component, MediaPacketScratch, MediaSocketPair, SocketError};
 use crate::runtime::admission::AdmissionLeaseGroup;
-use crate::runtime::deadline::{DeadlineError, DeadlineId, DeadlineOwner, DeadlineScheduler};
-use crate::runtime::media::MediaController;
 use crate::sip::auth::AuthContext;
 use crate::sip::dialog::{
     DialogManager, DialogManagerError, PrackTracker, SessionTimer, SessionTimerAction,
@@ -45,13 +47,14 @@ use crate::sip::transaction::manager::{
 use crate::sip::transport::failover::FailoverPlan;
 use crate::util::time::{advance_periodic, checked_deadline, minimum_deadline};
 
-use super::context::{CallContext, CallContextError};
-use super::events::{CallAction, CallCommand, CallEvent};
-use super::redirect::{RedirectError, RedirectHandler, RedirectPolicy};
-use super::signaling::{SignalingError, UdpSignaling};
-use super::state::{CallEndReason, CallState};
-use super::timers::CallTimer;
-use super::transfer::TransferTracker;
+use crate::call::model::context::{CallContext, CallContextError};
+use crate::call::model::events::{CallAction, CallCommand, CallEvent};
+use crate::call::model::redirect::{RedirectError, RedirectHandler, RedirectPolicy};
+use crate::call::model::state::{CallEndReason, CallState};
+use crate::call::model::transfer::TransferTracker;
+use crate::call::signaling::{SignalingError, UdpSignaling};
+
+use super::timer::CallTimer;
 
 /// Default per-call SIP transaction capacity.
 pub const DEFAULT_CALL_TRANSACTION_CAPACITY: usize = 128;
@@ -418,7 +421,7 @@ impl CallRuntime {
                 let current = self
                     .media
                     .work_token()
-                    .map(crate::runtime::media::MediaWorkToken::generation);
+                    .map(crate::call::media::controller::MediaWorkToken::generation);
                 if current != Some(generation) {
                     self.diagnostics.stale_media_work =
                         self.diagnostics.stale_media_work.saturating_add(1);

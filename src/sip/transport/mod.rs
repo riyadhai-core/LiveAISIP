@@ -20,30 +20,38 @@
 //! Bounded SIP signaling transport.
 
 /// Validated resolved transport destinations.
+#[path = "model/destination.rs"]
 pub mod destination;
 
 /// Reliable transport connection lifecycle and bounded outbound queues.
+#[path = "model/connection.rs"]
 pub mod connection;
 
 /// Bounded SIP-over-UDP datagram preparation.
+#[path = "udp/config.rs"]
 pub mod udp;
 
 /// Runtime-neutral SIP-over-UDP socket driver.
+#[path = "udp/driver.rs"]
 pub mod udp_driver;
 
 /// Validated messages shared by datagram and stream socket drivers.
 pub use udp_driver::{InboundMessage, ReceivedMessage};
 
 /// Incremental bounded SIP-over-TCP stream decoding.
+#[path = "tcp/config.rs"]
 pub mod tcp;
 
 /// Runtime-neutral SIP-over-TCP socket driver.
+#[path = "tcp/driver.rs"]
 pub mod tcp_driver;
 
 /// TLS security policy and handshake lifecycle.
+#[path = "tls/config.rs"]
 pub mod tls;
 
 /// Verified outbound SIP-over-TLS socket driver.
+#[path = "tls/driver.rs"]
 pub mod tls_driver;
 
 /// Commit-aware bounded signaling transport orchestration.
@@ -66,19 +74,24 @@ pub mod reactor;
 pub mod manager;
 
 /// Encoded-size and security-aware destination selection.
+#[path = "model/selection.rs"]
 pub mod selection;
 
 /// Hostile-network stream limits and liveness.
+#[path = "tcp/stream.rs"]
 pub mod stream;
 
 /// Bounded RFC 3263 destination planning over validated DNS answers.
 pub mod resolver;
 
 /// Transport-truth metadata and exact reliable-flow routing.
+#[path = "model/flow.rs"]
 pub mod flow;
 
 /// Wire-commit-aware bounded destination failover.
+#[path = "model/failover.rs"]
 pub mod failover;
 
 /// Bounded monotonic outbound-dial failure suppression.
+#[path = "model/backoff.rs"]
 pub mod backoff;

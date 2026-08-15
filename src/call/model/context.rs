@@ -25,7 +25,8 @@ use crate::observability::{CallTimeline, TimelineError, TimelineEvent};
 /// Default retained privacy-safe timeline events per call.
 pub const DEFAULT_CALL_TIMELINE_CAPACITY: usize = 256;
 
-/// Actor-owned call state, mutated only by its owning [`super::runtime::CallRuntime`].
+/// Actor-owned call state, mutated only by its owning
+/// [`CallRuntime`](crate::call::execution::runtime::CallRuntime).
 pub struct CallContext {
     lifecycle: CallLifecycle,
     timeline: CallTimeline,

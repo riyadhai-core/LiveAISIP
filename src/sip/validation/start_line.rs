@@ -32,7 +32,7 @@
 //! - response status codes.
 //!
 //! The returned values are owned typed representations. The original
-//! [`RawMessage`](crate::sip::types::message::RawMessage) remains unchanged and
+//! [`RawMessage`] remains unchanged and
 //! continues to preserve the exact wire representation.
 //!
 //! `CSeq` consistency and typed core-header validation belong to later

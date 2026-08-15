@@ -20,8 +20,9 @@
 //! Validated network endpoint and explicit bind-address primitives.
 //!
 //! Untrusted, resolved, observed, and configured addresses must not flow into
-//! signaling or media state as unchecked `SocketAddr` values. [`Endpoint`]
-//! proves that an address is concrete and has a nonzero port. [`BindAddress`]
+//! signaling or media state as unchecked `SocketAddr` values.
+//! [`Endpoint`](crate::net::address::Endpoint) proves that an address is concrete
+//! and has a nonzero port. [`BindAddress`](crate::net::address::BindAddress)
 //! separately represents local binding, where wildcard hosts and ephemeral
 //! ports are legitimate only when selected explicitly.
 //!

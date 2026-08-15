@@ -15,18 +15,18 @@
 //! Bounded registry of external call capabilities.
 //!
 //! The manager never stores or exposes mutable call internals. Every entry is
-//! only a [`CallHandle`](super::handle::CallHandle); the dedicated native call
-//! thread exclusively owns [`CallRuntime`](super::runtime::CallRuntime).
+//! only a [`CallHandle`]; the dedicated native call thread exclusively owns
+//! [`CallRuntime`].
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::time::Duration;
 
-use super::events::{CallAction, CallEvent};
 use super::handle::{CallActionReceiveError, CallHandle, CallSubmitErrorKind, CallToken};
 use super::runtime::{CallMessage, CallRuntime};
 use super::thread::{CallExit, CallThread, CallThreadConfig, CallThreadError};
+use crate::call::model::events::{CallAction, CallEvent};
 use crate::util::id::IdGenerator;
 
 /// Maximum calls configurable in one registry.

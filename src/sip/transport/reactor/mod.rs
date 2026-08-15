@@ -20,7 +20,8 @@
 //! One-thread, readiness-driven SIP transport reactor.
 //!
 //! This is the operating-system scheduling boundary around
-//! [`TransportService`]. Linux/Android use `epoll`; Apple and supported BSD
+//! [`TransportService`](crate::sip::transport::service::TransportService).
+//! Linux/Android use `epoll`; Apple and supported BSD
 //! targets use `kqueue`. Both backends are one-shot, so every delivered source
 //! is explicitly re-armed after bounded work. No socket gets a private thread.
 //!

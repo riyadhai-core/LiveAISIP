@@ -27,7 +27,8 @@
 //! `2^31`.
 //!
 //! Parsing performs no allocation for core methods. Extension methods retain
-//! their exact case through the shared SIP [`Method`] type.
+//! their exact case through the shared SIP
+//! [`Method`](crate::sip::types::method::Method) type.
 //!
 //! Cross-field requirements, such as verifying that a request's `CSeq` method
 //! matches its request-line method, belong to SIP message validation rather

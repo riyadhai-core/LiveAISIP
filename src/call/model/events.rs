@@ -14,7 +14,7 @@
 
 //! Events entering and actions leaving the single call authority.
 
-use super::leg::DialogBranchId;
+use super::branch::DialogBranchId;
 use super::state::CallEndReason;
 use crate::sip::parser::uri::{ParseError as UriParseError, parse_str};
 use crate::sip::types::uri::Uri;

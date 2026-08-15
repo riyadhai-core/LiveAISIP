@@ -31,5 +31,10 @@ jobs:
       - name: Reject compiler and Clippy warnings
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+      - name: Reject documentation warnings and broken links
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+        run: cargo doc --no-deps --all-features --locked
+
       - name: Run every test, example, and benchmark target
         run: cargo test --all-targets --all-features --locked

@@ -14,7 +14,8 @@
 
 //! Canonical SIP header-section serialization.
 //!
-//! Only validated [`HeaderName`] and [`HeaderValue`] values enter this layer,
+//! Only validated [`HeaderName`](crate::sip::types::header::HeaderName) and
+//! [`HeaderValue`](crate::sip::types::header::HeaderValue) values enter this layer,
 //! which makes CRLF injection unrepresentable. Each field is emitted as
 //! `Name: value\r\n`; recognized compact names are deliberately expanded to
 //! their canonical long form.

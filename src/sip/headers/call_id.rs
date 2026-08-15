@@ -26,7 +26,8 @@
 //! case-sensitive and is never normalized, decoded, or rewritten.
 //!
 //! Parsing is allocation-free until a successfully validated identifier is
-//! transferred into the owned [`CallId`] representation.
+//! transferred into the owned
+//! [`CallId`](crate::sip::headers::call_id::CallId) representation.
 
 use std::error::Error as StdError;
 use std::fmt;
