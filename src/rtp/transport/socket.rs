@@ -384,6 +384,20 @@ impl MediaSocketPair {
             .map_err(|source| SocketError::LocalAddress { component, source })
     }
 
+    /// Duplicates one component for call-reactor readiness observation.
+    ///
+    /// The duplicate never receives or sends media. It only keeps a stable
+    /// operating-system descriptor registered for the call-thread lifetime.
+    pub(crate) fn try_clone_readiness_socket(&self, component: Component) -> io::Result<UdpSocket> {
+        if !self.config.nonblocking() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "call media readiness requires nonblocking UDP",
+            ));
+        }
+        self.socket(component).try_clone()
+    }
+
     /// Creates correctly sized reusable receive storage for this pair.
     ///
     /// # Errors

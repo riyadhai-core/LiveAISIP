@@ -23,12 +23,3 @@
 pub mod format;
 /// Fixed-size PCM frame contracts.
 pub mod frame;
-
-/// Temporary compatibility path for the former combined audio module.
-pub mod audio {
-    pub use super::format::{AudioError, NetworkPacketization};
-    pub use super::frame::{
-        AI_BYTES_PER_FRAME, AI_FRAME_DURATION_MS, AI_SAMPLE_RATE_HZ, AI_SAMPLES_PER_FRAME,
-        AiAudioFrame,
-    };
-}

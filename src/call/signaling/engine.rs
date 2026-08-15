@@ -11,7 +11,7 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -164,6 +164,20 @@ impl UdpSignaling {
     #[must_use]
     pub const fn local_addr(&self) -> SocketAddr {
         self.driver.local_addr()
+    }
+
+    /// Duplicates the call-owned socket for readiness observation.
+    ///
+    /// The duplicate never performs protocol I/O and exists only as long as
+    /// the owning call reactor.
+    pub(crate) fn try_clone_readiness_socket(&self) -> io::Result<UdpSocket> {
+        if !self.driver.config().nonblocking() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "call signaling readiness requires nonblocking UDP",
+            ));
+        }
+        self.driver.try_clone_socket()
     }
 
     /// Selects the reachable address serialized into generated Via fields.
@@ -1347,8 +1361,8 @@ mod tests {
     use std::time::Duration;
 
     use super::UdpSignaling;
-    use crate::call::events::{CallAction, CallEvent};
-    use crate::runtime::deadline::DeadlineScheduler;
+    use crate::call::execution::deadline::DeadlineScheduler;
+    use crate::call::model::events::{CallAction, CallEvent};
     use crate::sip::auth::{AuthContext, DigestCredentials};
     use crate::sip::dialog::DialogManager;
     use crate::sip::parser::message;

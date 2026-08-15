@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use liveaisip::rtp::rtcp_scheduler::{RtcpScheduleConfig, RtcpScheduler, ScheduledReport};
+use liveaisip::rtp::session::rtcp::{RtcpScheduleConfig, RtcpScheduler, ScheduledReport};
 use liveaisip::rtp::stats::{CompactNtp, RttEstimator, RttUpdate};
 
 #[test]

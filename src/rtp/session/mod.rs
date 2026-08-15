@@ -812,10 +812,10 @@ mod tests {
         CompoundPolicy, CompoundRtcp, RtcpPacket, RtcpSenderInfo, SdesChunk, SdesItem,
         SdesItemType, SenderReport, SourceDescription,
     };
-    use crate::rtp::rtcp_scheduler::{RtcpScheduleConfig, ScheduledReport};
     use crate::rtp::security::{MediaSecurityPolicy, PacketProtection};
+    use crate::rtp::session::receive::RtpReceiveConfig;
+    use crate::rtp::session::rtcp::{RtcpScheduleConfig, ScheduledReport};
     use crate::rtp::source::SourcePolicy;
-    use crate::rtp::state::RtpReceiveConfig;
     use crate::rtp::transport::symmetric::{SymmetricConfig, SymmetricEndpoints};
 
     fn address(port: u16) -> SocketAddr {

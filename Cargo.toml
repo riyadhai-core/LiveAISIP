@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
-description = "High-performance SIP server for LiveAISIP."
+description = "Native SIP/RTP realtime telephony runtime for AI applications."
 readme = "README.md"
 
 keywords = [

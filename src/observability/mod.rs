@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Privacy-safe operational diagnostics and metrics.
+//! Privacy-safe operational diagnostics.
 
 /// Bounded per-call diagnostic timeline.
 pub mod diagnostics;
-/// Process-level metric primitives.
-pub mod metrics;
 
 pub use diagnostics::{CallTimeline, TimelineEntry, TimelineError, TimelineEvent};

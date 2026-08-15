@@ -434,7 +434,7 @@ impl StdError for DialogMediaError {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::media::{
+    use crate::call::media::controller::{
         DialogMediaOwner, MediaControlError, MediaController, MediaLifecycle, MediaShutdownAction,
         MediaShutdownPlan,
     };

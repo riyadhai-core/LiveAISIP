@@ -393,13 +393,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{CallManager, CallManagerError};
-    use crate::call::context::CallContext;
-    use crate::call::events::{CallAction, CallCommand, CallEvent};
-    use crate::call::handle::CallThreadPhase;
-    use crate::call::runtime::{
+    use crate::call::execution::handle::CallThreadPhase;
+    use crate::call::execution::runtime::{
         CallRuntime, CallRuntimeConfig, DEFAULT_CALL_DEADLINE_CAPACITY,
         DEFAULT_CALL_DIALOG_CAPACITY, DEFAULT_CALL_TRANSACTION_CAPACITY,
     };
+    use crate::call::model::context::CallContext;
+    use crate::call::model::events::{CallAction, CallCommand, CallEvent};
     use crate::runtime::admission::AdmissionLeaseGroup;
 
     fn runtime() -> CallRuntime {

@@ -19,7 +19,7 @@ use std::fmt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, TryRecvError};
 use std::thread::{self, JoinHandle};
 
 use crate::util::time::MonotonicClock;
@@ -28,6 +28,7 @@ use super::handle::{
     ActionReceiver, ActionSender, CallQueueSnapshot, CallToken, CommandReceiver, CommandSender,
     QueueMetrics, SharedCallStatus,
 };
+use super::reactor::{CallReactor, CallReactorError, CallReady};
 use super::runtime::{CallRuntime, CallRuntimeDiagnostics};
 
 /// Default inbound messages queued per call thread.
@@ -42,6 +43,8 @@ pub const DEFAULT_CALL_THREAD_STACK_BYTES: usize = 512 * 1_024;
 pub const MIN_CALL_THREAD_STACK_BYTES: usize = 128 * 1_024;
 /// Largest supported per-call native stack.
 pub const MAX_CALL_THREAD_STACK_BYTES: usize = 8 * 1_024 * 1_024;
+/// Maximum commands consumed before socket readiness is checked again.
+pub const MAX_CALL_COMMANDS_PER_TURN: usize = 64;
 
 /// Validated native call-thread resource policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,9 +199,11 @@ impl CallThread {
             Box<dyn FnOnce() -> CallExit + Send>,
         ) -> io::Result<JoinHandle<CallExit>>,
     {
+        let (reactor, notifier) = CallReactor::new(&runtime).map_err(CallThreadError::Reactor)?;
         let (command_tx, command_rx) = mpsc::sync_channel(config.mailbox_capacity);
         let command_metrics = Arc::new(QueueMetrics::new(config.mailbox_capacity));
-        let commands = CommandSender::new(command_tx, Arc::clone(&command_metrics));
+        let commands =
+            CommandSender::new(command_tx, Arc::clone(&command_metrics)).with_notifier(notifier);
         let command_receiver = CommandReceiver::new(command_rx, Arc::clone(&command_metrics));
 
         let (action_tx, action_rx) = mpsc::sync_channel(config.action_capacity);
@@ -217,6 +222,7 @@ impl CallThread {
         let entry: Box<dyn FnOnce() -> CallExit + Send> = Box::new(move || {
             call_thread_entry(
                 runtime,
+                reactor,
                 command_receiver,
                 action_sender,
                 thread_status,
@@ -257,6 +263,7 @@ impl fmt::Debug for CallThread {
 
 fn call_thread_entry(
     mut runtime: CallRuntime,
+    mut reactor: CallReactor,
     commands: CommandReceiver,
     actions: ActionSender,
     status: Arc<SharedCallStatus>,
@@ -268,13 +275,14 @@ fn call_thread_entry(
     let clock = MonotonicClock::start();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         runtime.claim_current_thread().map_err(|_| ())?;
-        run_call(&mut runtime, &commands, &actions, &clock)
+        run_call(&mut runtime, &mut reactor, &commands, &actions, &clock)
     }));
     let mut kind = match outcome {
         Ok(Ok(())) => CallExitKind::Completed,
         Ok(Err(())) => CallExitKind::Failed,
         Err(_) => CallExitKind::Panicked,
     };
+    drop(reactor);
     let cleanup = catch_unwind(AssertUnwindSafe(|| runtime.finish_cleanup()));
     if !matches!(cleanup, Ok(Ok(()))) {
         kind = CallExitKind::Panicked;
@@ -301,54 +309,95 @@ fn call_thread_entry(
 
 fn run_call(
     runtime: &mut CallRuntime,
+    reactor: &mut CallReactor,
     commands: &CommandReceiver,
     actions: &ActionSender,
     clock: &MonotonicClock,
 ) -> Result<(), ()> {
     let mut mailbox_open = true;
+    let mut mailbox_shutdown_started = false;
+    let mut command_backlog = true;
+    let mut ready = CallReady::default();
     loop {
         let now = clock.now();
         let due = runtime.process_due_deadlines(now).map_err(|_| ())?;
         publish_actions(runtime, actions, due)?;
+
+        if ready.rtp() {
+            let produced = runtime
+                .handle(
+                    crate::call::execution::runtime::CallMessage::NetworkReady(
+                        crate::rtp::transport::Component::Rtp,
+                    ),
+                    clock.now(),
+                )
+                .map_err(|_| ())?;
+            publish_actions(runtime, actions, produced)?;
+        }
+        if ready.rtcp() {
+            let produced = runtime
+                .handle(
+                    crate::call::execution::runtime::CallMessage::NetworkReady(
+                        crate::rtp::transport::Component::Rtcp,
+                    ),
+                    clock.now(),
+                )
+                .map_err(|_| ())?;
+            publish_actions(runtime, actions, produced)?;
+        }
+        if ready.signaling() {
+            let produced = runtime
+                .handle(
+                    crate::call::execution::runtime::CallMessage::SignalingReady,
+                    clock.now(),
+                )
+                .map_err(|_| ())?;
+            publish_actions(runtime, actions, produced)?;
+        }
         if runtime.is_finished() {
             return Ok(());
         }
-        let deadline = runtime.next_deadline().map_err(|_| ())?;
-        let wait = deadline.map(|at| clock.remaining_until(at));
-        let message = if mailbox_open {
-            match wait {
-                Some(timeout) => match commands.recv_timeout(timeout) {
-                    Ok(message) => Some(message),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        mailbox_open = false;
-                        None
-                    }
-                },
-                None => {
-                    if let Ok(message) = commands.recv() {
-                        Some(message)
-                    } else {
-                        mailbox_open = false;
-                        None
-                    }
+
+        if ready.command() {
+            command_backlog = true;
+        }
+        let mut commands_processed = 0;
+        while mailbox_open && command_backlog && commands_processed < MAX_CALL_COMMANDS_PER_TURN {
+            match commands.try_recv() {
+                Ok(Some(message)) => {
+                    let produced = runtime.handle(message, clock.now()).map_err(|_| ())?;
+                    publish_actions(runtime, actions, produced)?;
+                    commands_processed += 1;
+                }
+                Ok(None) | Err(TryRecvError::Empty) => {
+                    command_backlog = false;
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    mailbox_open = false;
+                    command_backlog = false;
                 }
             }
-        } else {
-            match wait {
-                Some(timeout) if !timeout.is_zero() => thread::park_timeout(timeout),
-                None => return Err(()),
-                _ => {}
-            }
-            None
-        };
-        if let Some(message) = message {
-            let produced = runtime.handle(message, clock.now()).map_err(|_| ())?;
-            publish_actions(runtime, actions, produced)?;
-        } else if !mailbox_open {
+        }
+        if commands_processed == MAX_CALL_COMMANDS_PER_TURN {
+            command_backlog = true;
+        }
+        if !mailbox_open && !mailbox_shutdown_started {
             let produced = runtime.begin_shutdown(clock.now()).map_err(|_| ())?;
             publish_actions(runtime, actions, produced)?;
+            mailbox_shutdown_started = true;
         }
+        if runtime.is_finished() {
+            return Ok(());
+        }
+
+        let deadline = runtime.next_deadline().map_err(|_| ())?;
+        let wait = if command_backlog {
+            Some(std::time::Duration::ZERO)
+        } else {
+            deadline.map(|at| clock.remaining_until(at))
+        };
+        ready = reactor.wait(wait).map_err(|_| ())?;
     }
 }
 
@@ -377,6 +426,8 @@ pub enum CallThreadError {
     InvalidStackSize,
     /// The operating system refused native thread creation.
     Spawn(io::Error),
+    /// The call-owned readiness reactor could not be constructed.
+    Reactor(CallReactorError),
     /// Native thread was already joined by another handle clone.
     AlreadyJoined,
     /// Panic escaped the outer containment boundary.
@@ -401,6 +452,7 @@ impl CallThreadError {
             Self::InvalidActionCapacity => "invalid-action-capacity",
             Self::InvalidStackSize => "invalid-stack-size",
             Self::Spawn(_) => "spawn",
+            Self::Reactor(_) => "reactor",
             Self::AlreadyJoined => "already-joined",
             Self::UncontainedPanic => "uncontained-panic",
         }
@@ -417,6 +469,7 @@ impl StdError for CallThreadError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Spawn(source) => Some(source),
+            Self::Reactor(source) => Some(source),
             _ => None,
         }
     }
@@ -431,16 +484,18 @@ mod tests {
     use std::time::Duration;
 
     use super::{CallExitKind, CallThread, CallThreadConfig};
-    use crate::call::context::CallContext;
-    use crate::call::events::{CallAction, CallCommand, CallEvent};
-    use crate::call::handle::{ActionSender, CallHandle, CallThreadPhase, CallToken, QueueMetrics};
-    use crate::call::leg::DialogBranchId;
-    use crate::call::runtime::{
+    use crate::call::execution::handle::{
+        ActionSender, CallHandle, CallThreadPhase, CallToken, QueueMetrics,
+    };
+    use crate::call::execution::runtime::{
         CallMessage, CallRuntime, CallRuntimeConfig, DEFAULT_CALL_DEADLINE_CAPACITY,
         DEFAULT_CALL_DIALOG_CAPACITY, DEFAULT_CALL_TRANSACTION_CAPACITY,
     };
+    use crate::call::model::branch::DialogBranchId;
+    use crate::call::model::context::CallContext;
+    use crate::call::model::events::{CallAction, CallCommand, CallEvent};
+    use crate::call::model::state::CallEndReason;
     use crate::call::signaling::UdpSignaling;
-    use crate::call::state::CallEndReason;
     use crate::rtp::transport::{MediaSocketPair, PortPool, SocketConfig};
     use crate::runtime::admission::{AdmissionController, AdmissionLeaseGroup};
     use crate::sip::headers::retry_after::RetryAfter;

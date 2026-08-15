@@ -23,18 +23,3 @@
 pub mod admission;
 /// Coordinated graceful shutdown.
 pub mod shutdown;
-
-/// Temporary compatibility path for call-owned deadline scheduling.
-pub mod deadline {
-    pub use crate::call::execution::deadline::*;
-}
-
-/// Temporary compatibility path for call-owned media generation control.
-pub mod media {
-    pub use crate::call::media::controller::*;
-}
-
-/// Temporary compatibility path for call health evaluation.
-pub mod signaling {
-    pub use crate::call::model::health::*;
-}

@@ -35,8 +35,9 @@ sip      rtp      media
 - `runtime`: process-wide admission, worker health, control, and shutdown only.
 - `ffi`: the future stable native boundary. Protocol modules must not import it.
 
-Compatibility re-exports preserve old source paths during the tree migration.
-They do not create another semantic owner.
+The pre-reorganization compatibility paths were removed during the `0.1.0`
+alpha cycle. New code must use the ownership-oriented module paths directly;
+the project will not carry two apparent public architectures into `1.0`.
 
 ## Process containment
 
@@ -62,9 +63,9 @@ notifications are bounded observations and cannot prevent ACK, CANCEL, BYE,
 media, refresh, rekey, or cleanup work. Existing calls and media deadlines take
 priority over new admission, notifications, and diagnostics.
 
-Idle call threads must eventually block on command wakeup, SIP/RTP/RTCP
-readiness, shutdown, and the nearest monotonic deadline. Active media retains an
-absolute 10 ms clock. Periodic 10 ms signaling polling is not the target design.
+Idle call threads block on command wakeup, SIP/RTP/RTCP readiness, shutdown, and
+the nearest monotonic deadline. Active media retains an absolute 10 ms clock;
+signaling-only calls have no periodic polling wakeup.
 
 ## Configuration and versioning
 

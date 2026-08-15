@@ -290,9 +290,11 @@ impl StdError for LifecycleError {
 #[cfg(test)]
 mod tests {
     use super::CallLifecycle;
-    use crate::call::events::{CallAction, CallCommand, CallEvent, SessionModificationMethod};
-    use crate::call::leg::DialogBranchId;
-    use crate::call::state::{CallEndReason, CallState};
+    use crate::call::model::branch::DialogBranchId;
+    use crate::call::model::events::{
+        CallAction, CallCommand, CallEvent, SessionModificationMethod,
+    };
+    use crate::call::model::state::{CallEndReason, CallState};
 
     fn branch(value: &str) -> DialogBranchId {
         DialogBranchId::new(value).unwrap_or_else(|_| panic!("branch"))

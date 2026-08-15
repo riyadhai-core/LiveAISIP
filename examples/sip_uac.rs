@@ -21,8 +21,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use liveaisip::call::context::CallContext;
-use liveaisip::call::manager::CallManager;
+use liveaisip::call::execution::manager::CallManager;
+use liveaisip::call::model::context::CallContext;
 use liveaisip::call::{
     CallAction, CallCommand, CallEvent, CallRuntime, CallRuntimeConfig, CallThreadPhase,
     UdpSignaling,

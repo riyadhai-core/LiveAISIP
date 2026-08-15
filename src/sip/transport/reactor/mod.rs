@@ -1196,11 +1196,42 @@ struct OsReady {
 struct OsPoller {
     descriptor: OwnedFd,
     events: Box<[libc::epoll_event]>,
+    masks: EpollMasks,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy)]
+struct EpollMasks {
+    input: u32,
+    output: u32,
+    error: u32,
+    hangup: u32,
+    remote_hangup: u32,
+    one_shot: u32,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl EpollMasks {
+    fn from_platform() -> io::Result<Self> {
+        Ok(Self {
+            input: epoll_mask(libc::EPOLLIN)?,
+            output: epoll_mask(libc::EPOLLOUT)?,
+            error: epoll_mask(libc::EPOLLERR)?,
+            hangup: epoll_mask(libc::EPOLLHUP)?,
+            remote_hangup: epoll_mask(libc::EPOLLRDHUP)?,
+            one_shot: epoll_mask(libc::EPOLLONESHOT)?,
+        })
+    }
+
+    const fn terminal(self) -> u32 {
+        self.error | self.hangup | self.remote_hangup
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 impl OsPoller {
     fn new(capacity: usize) -> io::Result<Self> {
+        let masks = EpollMasks::from_platform()?;
         // SAFETY: `epoll_create1` has no pointer arguments; a nonnegative
         // return value is a newly owned descriptor.
         let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
@@ -1218,6 +1249,7 @@ impl OsPoller {
         Ok(Self {
             descriptor,
             events: events.into_boxed_slice(),
+            masks,
         })
     }
 
@@ -1269,12 +1301,12 @@ impl OsPoller {
             };
             if count >= 0 {
                 for event in &self.events[..usize::try_from(count).unwrap_or(0)] {
-                    let flags = event.events as i32;
+                    let flags = event.events;
                     output.push(OsReady {
                         key: usize::try_from(event.u64).unwrap_or(usize::MAX),
-                        readable: flags & libc::EPOLLIN != 0,
-                        writable: flags & libc::EPOLLOUT != 0,
-                        terminal: flags & (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) != 0,
+                        readable: flags & self.masks.input != 0,
+                        writable: flags & self.masks.output != 0,
+                        terminal: flags & self.masks.terminal() != 0,
                     });
                 }
                 return Ok(());
@@ -1296,27 +1328,45 @@ impl OsPoller {
         key: usize,
         interest: Interest,
     ) -> io::Result<()> {
-        let mut flags = libc::EPOLLONESHOT | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP;
+        let mut flags = self.masks.one_shot | self.masks.terminal();
         if interest.readable {
-            flags |= libc::EPOLLIN;
+            flags |= self.masks.input;
         }
         if interest.writable {
-            flags |= libc::EPOLLOUT;
+            flags |= self.masks.output;
         }
         let mut event = libc::epoll_event {
-            events: flags as u32,
-            u64: key as u64,
+            events: flags,
+            u64: u64::try_from(key).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "epoll key exceeds u64")
+            })?,
         };
         // SAFETY: all descriptors are live and `event` is initialized for the
         // duration of the control call.
-        let result =
-            unsafe { libc::epoll_ctl(self.descriptor.as_raw_fd(), operation, source, &mut event) };
+        let result = unsafe {
+            libc::epoll_ctl(
+                self.descriptor.as_raw_fd(),
+                operation,
+                source,
+                &raw mut event,
+            )
+        };
         if result == 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_mask(value: i32) -> io::Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "platform exposed a negative epoll event mask",
+        )
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use liveaisip::media::audio::{AI_SAMPLE_RATE_HZ, AI_SAMPLES_PER_FRAME};
+use liveaisip::media::frame::{AI_SAMPLE_RATE_HZ, AI_SAMPLES_PER_FRAME};
 use liveaisip::sip::sdp::parser::parse;
 use liveaisip::sip::sdp::{Direction, RtpMediaOffer};
 

@@ -26,6 +26,7 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
+use std::net::UdpSocket;
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
@@ -72,9 +73,6 @@ pub const MAX_MEDIA_TICKS_PER_CYCLE: u64 = 8;
 pub const MAX_DUE_DEADLINES_PER_CYCLE: usize = 64;
 /// Maximum media datagrams consumed for one readiness notification.
 pub const MAX_MEDIA_DATAGRAMS_PER_POLL: usize = 64;
-/// Maximum delay before the owner thread checks its nonblocking SIP socket.
-pub const SIGNALING_IO_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
 /// Immutable capacities and teardown policy for one call runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallRuntimeConfig {
@@ -212,7 +210,6 @@ pub struct CallRuntime {
     shutdown_grace: Duration,
     shutdown_deadline: Option<Duration>,
     next_media_deadline: Option<Duration>,
-    next_signaling_poll: Option<Duration>,
     shutting_down: bool,
     cleaned_up: bool,
     diagnostics: CallRuntimeDiagnostics,
@@ -260,7 +257,6 @@ impl CallRuntime {
             shutdown_grace: config.shutdown_grace,
             shutdown_deadline: None,
             next_media_deadline: None,
-            next_signaling_poll: None,
             shutting_down: false,
             cleaned_up: false,
             diagnostics: CallRuntimeDiagnostics::default(),
@@ -338,6 +334,25 @@ impl CallRuntime {
         Ok(self)
     }
 
+    /// Duplicates the installed SIP socket for call-reactor readiness only.
+    pub(crate) fn try_clone_signaling_readiness(&self) -> io::Result<Option<UdpSocket>> {
+        self.signaling
+            .as_ref()
+            .map(UdpSignaling::try_clone_readiness_socket)
+            .transpose()
+    }
+
+    /// Duplicates one installed media socket for call-reactor readiness only.
+    pub(crate) fn try_clone_media_readiness(
+        &self,
+        component: Component,
+    ) -> io::Result<Option<UdpSocket>> {
+        self.media_sockets
+            .as_ref()
+            .map(|sockets| sockets.try_clone_readiness_socket(component))
+            .transpose()
+    }
+
     /// Returns whether emitted actions are already executed by an installed
     /// call-owned signaling driver and therefore form an observational stream.
     ///
@@ -395,10 +410,6 @@ impl CallRuntime {
                         signaling
                             .start(&mut self.transactions, &mut self.deadlines, now)
                             .map_err(CallRuntimeError::Signaling)?;
-                        self.next_signaling_poll = Some(
-                            checked_deadline(now, SIGNALING_IO_POLL_INTERVAL)
-                                .map_err(|_| CallRuntimeError::TimeOverflow)?,
-                        );
                     }
                     signaling
                         .execute_call_actions(
@@ -630,19 +641,6 @@ impl CallRuntime {
     ) -> Result<Vec<CallAction>, CallRuntimeError> {
         self.verify_owner()?;
         let mut actions = Vec::new();
-        if self
-            .next_signaling_poll
-            .is_some_and(|deadline| now >= deadline)
-        {
-            actions.extend(self.poll_signaling(now)?);
-            let current = self
-                .next_signaling_poll
-                .ok_or(CallRuntimeError::TimeOverflow)?;
-            let advance = advance_periodic(current, now, SIGNALING_IO_POLL_INTERVAL, 1)
-                .map_err(|_| CallRuntimeError::TimeOverflow)?
-                .ok_or(CallRuntimeError::TimeOverflow)?;
-            self.next_signaling_poll = Some(advance.next_deadline());
-        }
         for _ in 0..MAX_DUE_DEADLINES_PER_CYCLE {
             let Some(due) = self.deadlines.poll(now) else {
                 break;
@@ -701,7 +699,6 @@ impl CallRuntime {
             self.deadlines.next_deadline(),
             self.shutdown_deadline,
             self.next_media_deadline,
-            self.next_signaling_poll,
         ]))
     }
 
@@ -720,7 +717,6 @@ impl CallRuntime {
         self.dialogs.begin_shutdown();
         self.media.begin_draining();
         self.next_media_deadline = None;
-        self.next_signaling_poll = None;
         self.shutdown_deadline = Some(
             checked_deadline(now, self.shutdown_grace)
                 .map_err(|_| CallRuntimeError::TimeOverflow)?,
@@ -755,7 +751,6 @@ impl CallRuntime {
         self.transactions.begin_shutdown();
         self.dialogs.begin_shutdown();
         self.next_media_deadline = None;
-        self.next_signaling_poll = None;
         self.media.begin_draining();
         self.media.close();
         self.signaling = None;
@@ -984,7 +979,6 @@ impl fmt::Debug for CallRuntime {
             .field("packet_scratch", &self.packet_scratch.is_some())
             .field("rtp_session", &self.rtp_session.is_some())
             .field("signaling", &self.signaling.is_some())
-            .field("signaling_poll_active", &self.next_signaling_poll.is_some())
             .field("shutting_down", &self.shutting_down)
             .field("cleaned_up", &self.cleaned_up)
             .field("diagnostics", &self.diagnostics)
@@ -1082,23 +1076,23 @@ mod tests {
         CallMessage, CallRuntime, CallRuntimeConfig, CallRuntimeError, MAX_MEDIA_TICKS_PER_CYCLE,
         MEDIA_TICK_INTERVAL,
     };
-    use crate::call::context::CallContext;
-    use crate::call::events::{CallAction, CallCommand, CallEvent};
-    use crate::call::timers::CallTimer;
-    use crate::call::transfer::TransferState;
+    use crate::call::execution::deadline::DeadlineOwner;
+    use crate::call::execution::timer::CallTimer;
+    use crate::call::model::context::CallContext;
+    use crate::call::model::events::{CallAction, CallCommand, CallEvent};
+    use crate::call::model::transfer::TransferState;
     use crate::rtp::clock::RtpClockRate;
     use crate::rtp::liveness::MediaLiveness;
     use crate::rtp::security::MediaSecurityPolicy;
     use crate::rtp::session::RtpSession;
+    use crate::rtp::session::receive::RtpReceiveConfig;
     use crate::rtp::source::SourcePolicy;
-    use crate::rtp::state::RtpReceiveConfig;
     use crate::rtp::transport::symmetric::{SymmetricConfig, SymmetricEndpoints};
     use crate::rtp::transport::{
         Component, DEFAULT_MAX_MEDIA_DATAGRAM_BYTES, MediaPacketScratch, MediaSocketPair, PortPool,
         SocketConfig,
     };
     use crate::runtime::admission::AdmissionLeaseGroup;
-    use crate::runtime::deadline::DeadlineOwner;
     use crate::sip::dialog::{Refresher, SessionTimer};
 
     fn runtime() -> CallRuntime {

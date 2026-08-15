@@ -3,8 +3,8 @@
 This repository is the outbound-primary LiveAISIP Runtime SIP/RTP core. It is
 still alpha software: the deterministic protocol and resource-policy layers
 below are implemented, while the Rust playout engine, Sonora processing, SRTP
-cryptography, event-driven call reactor, Router control transport, and Python
-bindings remain separate integration stages.
+cryptography, Router control transport, and Python bindings remain separate
+integration stages.
 
 ## Architecture invariant
 
@@ -33,6 +33,7 @@ described as production-ready elsewhere.
 | 401/407 Digest retry | yes | yes | yes | yes | no | no |
 | CANCEL and final-response races | yes | yes | yes | partial | no | no |
 | Dialog Contact/Record-Route routing | yes | yes | yes | yes | no | no |
+| Per-call command/SIP/RTP/RTCP reactor | yes | yes | yes | yes | no | no |
 | In-dialog inbound requests | yes | partial | partial | partial | no | no |
 | PRACK/100rel | yes | yes | no | simulated | no | no |
 | Session timers | yes | yes | no | simulated | no | no |

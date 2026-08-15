@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::ThreadId;
 use std::time::Duration;
 
+use super::reactor::CallReactorNotifier;
 use super::runtime::CallMessage;
 use super::thread::{CallExit, CallThread, CallThreadError, SpawnedCall};
 use crate::call::model::events::{CallAction, CallEvent, CallReference};
@@ -73,6 +74,8 @@ pub struct CallQueueSnapshot {
     pub rejected_full: u64,
     /// Messages rejected after the receiver closed.
     pub rejected_closed: u64,
+    /// Accepted messages whose redundant wake notification failed.
+    pub wake_failures: u64,
 }
 
 pub(crate) struct QueueMetrics {
@@ -81,6 +84,7 @@ pub(crate) struct QueueMetrics {
     high_water: AtomicUsize,
     rejected_full: AtomicU64,
     rejected_closed: AtomicU64,
+    wake_failures: AtomicU64,
 }
 
 impl QueueMetrics {
@@ -91,6 +95,7 @@ impl QueueMetrics {
             high_water: AtomicUsize::new(0),
             rejected_full: AtomicU64::new(0),
             rejected_closed: AtomicU64::new(0),
+            wake_failures: AtomicU64::new(0),
         }
     }
 
@@ -125,6 +130,7 @@ impl QueueMetrics {
             high_water_mark: self.high_water.load(Ordering::Relaxed),
             rejected_full: self.rejected_full.load(Ordering::Relaxed),
             rejected_closed: self.rejected_closed.load(Ordering::Relaxed),
+            wake_failures: self.wake_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -133,11 +139,21 @@ impl QueueMetrics {
 pub(crate) struct CommandSender {
     sender: SyncSender<CallMessage>,
     metrics: Arc<QueueMetrics>,
+    notifier: Option<CallReactorNotifier>,
 }
 
 impl CommandSender {
     pub(crate) fn new(sender: SyncSender<CallMessage>, metrics: Arc<QueueMetrics>) -> Self {
-        Self { sender, metrics }
+        Self {
+            sender,
+            metrics,
+            notifier: None,
+        }
+    }
+
+    pub(crate) fn with_notifier(mut self, notifier: CallReactorNotifier) -> Self {
+        self.notifier = Some(notifier);
+        self
     }
 
     fn try_send(&self, message: CallMessage) -> Result<(), CallSubmitError> {
@@ -150,7 +166,16 @@ impl CommandSender {
             return Err(CallSubmitError::new(CallSubmitErrorKind::Full, message));
         }
         match self.sender.try_send(message) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if self
+                    .notifier
+                    .as_ref()
+                    .is_some_and(|notifier| notifier.notify().is_err())
+                {
+                    self.metrics.wake_failures.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
             Err(TrySendError::Full(message)) => {
                 self.metrics.release();
                 self.metrics.rejected_full.fetch_add(1, Ordering::Relaxed);
@@ -175,19 +200,15 @@ impl CommandReceiver {
         Self { receiver, metrics }
     }
 
-    pub(crate) fn recv(&self) -> Result<CallMessage, std::sync::mpsc::RecvError> {
-        let message = self.receiver.recv()?;
-        self.metrics.release();
-        Ok(message)
-    }
-
-    pub(crate) fn recv_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<CallMessage, std::sync::mpsc::RecvTimeoutError> {
-        let message = self.receiver.recv_timeout(timeout)?;
-        self.metrics.release();
-        Ok(message)
+    pub(crate) fn try_recv(&self) -> Result<Option<CallMessage>, TryRecvError> {
+        match self.receiver.try_recv() {
+            Ok(message) => {
+                self.metrics.release();
+                Ok(Some(message))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(TryRecvError::Disconnected),
+        }
     }
 }
 
@@ -541,8 +562,8 @@ mod tests {
     use std::sync::mpsc;
 
     use super::{CommandSender, QueueMetrics};
-    use crate::call::events::{CallCommand, CallEvent};
-    use crate::call::runtime::CallMessage;
+    use crate::call::execution::runtime::CallMessage;
+    use crate::call::model::events::{CallCommand, CallEvent};
 
     #[test]
     fn command_queue_reserves_shutdown_capacity_and_counts_overflow() {

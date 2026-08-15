@@ -17,6 +17,7 @@
 pub mod deadline;
 pub mod handle;
 pub mod manager;
+pub mod reactor;
 pub mod runtime;
 pub mod thread;
 pub mod timer;

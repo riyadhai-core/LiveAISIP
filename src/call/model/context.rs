@@ -177,7 +177,7 @@ mod tests {
     use std::time::Duration;
 
     use super::CallContext;
-    use crate::call::events::{CallAction, CallCommand, CallEvent};
+    use crate::call::model::events::{CallAction, CallCommand, CallEvent};
 
     #[test]
     fn only_actor_processing_mutates_lifecycle() {
@@ -186,7 +186,7 @@ mod tests {
         };
         assert_eq!(
             context.lifecycle().state(),
-            crate::call::state::CallState::Idle
+            crate::call::model::state::CallState::Idle
         );
         assert!(matches!(
             context.handle(CallEvent::Command(CallCommand::Start), Duration::from_millis(1)),
@@ -194,7 +194,7 @@ mod tests {
         ));
         assert_eq!(
             context.lifecycle().state(),
-            crate::call::state::CallState::Inviting
+            crate::call::model::state::CallState::Inviting
         );
     }
 }
